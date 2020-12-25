@@ -1,48 +1,44 @@
 -- | Types and functions related to the server initialisation
-{-# LANGUAGE CPP #-}
 {-# OPTIONS_GHC -O0 #-}
+{-# LANGUAGE CPP #-}
 module Hasura.Server.Init
   ( module Hasura.Server.Init
   , module Hasura.Server.Init.Config
   ) where
 
-import qualified Data.Aeson                       as J
-import qualified Data.Aeson.Casing                as J
-import qualified Data.Aeson.TH                    as J
-import qualified Data.HashSet                     as Set
-import qualified Data.String                      as DataString
-import qualified Data.Text                        as T
-import qualified Data.Text.Encoding               as TE
-import qualified Database.PG.Query                as Q
-import qualified Language.Haskell.TH.Syntax       as TH
-import qualified Text.PrettyPrint.ANSI.Leijen     as PP
+import qualified Data.Aeson                          as J
+import qualified Data.Aeson.Casing                   as J
+import qualified Data.Aeson.TH                       as J
+import qualified Data.HashSet                        as Set
+import qualified Data.String                         as DataString
+import qualified Data.Text                           as T
+import qualified Data.Text.Encoding                  as TE
+import qualified Database.PG.Query                   as Q
+import qualified Language.Haskell.TH.Syntax          as TH
+import qualified Text.PrettyPrint.ANSI.Leijen        as PP
 
-import           Data.FileEmbed                   (embedStringFile)
-import           Data.Time                        (NominalDiffTime)
-import           Network.Wai.Handler.Warp         (HostPreference)
+import           Data.FileEmbed                      (embedStringFile)
+import           Data.Time                           (NominalDiffTime)
+import           Network.Wai.Handler.Warp            (HostPreference)
+import qualified Network.WebSockets                  as WS
 import           Options.Applicative
 
-import qualified Hasura.Cache.Bounded             as Cache
-import qualified Hasura.GraphQL.Execute           as E
-import qualified Hasura.GraphQL.Execute.LiveQuery as LQ
-import qualified Hasura.Logging                   as L
+import qualified Hasura.Cache.Bounded                as Cache
+import qualified Hasura.GraphQL.Execute.LiveQuery    as LQ
+import qualified Hasura.GraphQL.Execute.Plan         as E
+import qualified Hasura.Logging                      as L
 
-import           Hasura.Db
+import           Hasura.Backends.Postgres.Connection
 import           Hasura.Prelude
-import           Hasura.RQL.Types                 (QErr, SchemaCache (..))
+import           Hasura.RQL.Types                    (QErr, SchemaCache (..), RemoteSchemaPermsCtx (..))
 import           Hasura.Server.Auth
 import           Hasura.Server.Cors
 import           Hasura.Server.Init.Config
 import           Hasura.Server.Logging
+import           Hasura.Server.Types
 import           Hasura.Server.Utils
 import           Hasura.Session
-import           Network.URI                      (parseURI)
-
-newtype DbUid
-  = DbUid { getDbUid :: Text }
-  deriving (Show, Eq, J.ToJSON, J.FromJSON)
-
-newtype PGVersion = PGVersion { unPGVersion :: Int } deriving (Show, Eq, J.ToJSON)
+import           Network.URI                         (parseURI)
 
 getDbId :: Q.TxE QErr Text
 getDbId =
@@ -54,10 +50,6 @@ getDbId =
 
 getPgVersion :: Q.TxE QErr PGVersion
 getPgVersion = PGVersion <$> Q.serverVersion
-
-newtype InstanceId
-  = InstanceId { getInstanceId :: Text }
-  deriving (Show, Eq, J.ToJSON, J.FromJSON, Q.FromCol, Q.ToPrepArg)
 
 generateInstanceId :: IO InstanceId
 generateInstanceId = InstanceId <$> generateFingerprint
@@ -99,7 +91,7 @@ withEnvBool bVal envVar =
   where
     considerEnv' = do
       mEnvVal <- considerEnv envVar
-      maybe (return False) return mEnvVal
+      return $ Just True == mEnvVal
 
 withEnvJwtConf :: Maybe JWTConfig -> String -> WithEnv (Maybe JWTConfig)
 withEnvJwtConf jVal envVar =
@@ -153,7 +145,7 @@ mkServeOptions rso = do
                      withEnv (rsoEnabledAPIs rso) (fst enabledAPIsEnv)
   lqOpts <- mkLQOpts
   enableAL <- withEnvBool (rsoEnableAllowlist rso) $ fst enableAllowlistEnv
-  enabledLogs <- maybe L.defaultEnabledLogTypes (Set.fromList) <$>
+  enabledLogs <- maybe L.defaultEnabledLogTypes Set.fromList <$>
                  withEnv (rsoEnabledLogTypes rso) (fst enabledLogsEnv)
   serverLogLevel <- fromMaybe L.LevelInfo <$> withEnv (rsoLogLevel rso) (fst logLevelEnv)
   planCacheOptions <- E.PlanCacheOptions . fromMaybe 4000 <$>
@@ -169,13 +161,29 @@ mkServeOptions rso = do
   eventsHttpPoolSize <- withEnv (rsoEventsHttpPoolSize rso) (fst eventsHttpPoolSizeEnv)
   eventsFetchInterval <- withEnv (rsoEventsFetchInterval rso) (fst eventsFetchIntervalEnv)
   logHeadersFromEnv <- withEnvBool (rsoLogHeadersFromEnv rso) (fst logHeadersFromEnvEnv)
+  enableRemoteSchemaPerms <-
+    bool RemoteSchemaPermsDisabled RemoteSchemaPermsEnabled <$>
+    (withEnvBool (rsoEnableRemoteSchemaPermissions rso) $
+                (fst enableRemoteSchemaPermsEnv))
+
+  webSocketCompressionFromEnv <- withEnvBool (rsoWebSocketCompression rso) $
+                                 fst webSocketCompressionEnv
+
+  let connectionOptions = WS.defaultConnectionOptions {
+                            WS.connectionCompressionOptions =
+                              if webSocketCompressionFromEnv
+                                then WS.PermessageDeflateCompression WS.defaultPermessageDeflate
+                                else WS.NoCompression
+                          }
+  webSocketKeepAlive <- KeepAliveDelay . fromIntegral . fromMaybe 5
+      <$> withEnv (rsoWebSocketKeepAlive rso) (fst webSocketKeepAliveEnv)
 
   return $ ServeOptions port host connParams txIso adminScrt authHook jwtSecret
                         unAuthRole corsCfg enableConsole consoleAssetsDir
                         enableTelemetry strfyNum enabledAPIs lqOpts enableAL
                         enabledLogs serverLogLevel planCacheOptions
                         internalErrorsConfig eventsHttpPoolSize eventsFetchInterval
-                        logHeadersFromEnv
+                        logHeadersFromEnv enableRemoteSchemaPerms connectionOptions webSocketKeepAlive
   where
 #ifdef DeveloperAPIs
     defaultAPIs = [METADATA,GRAPHQL,PGDUMP,CONFIG,DEVELOPER]
@@ -195,11 +203,11 @@ mkServeOptions rso = do
     mkAuthHook (AuthHookG mUrl mType) = do
       mUrlEnv <- withEnv mUrl $ fst authHookEnv
       authModeM <- withEnv mType (fst authHookModeEnv)
-      ty <- maybe (authHookTyEnv mType) return authModeM
+      ty <- onNothing authModeM (authHookTyEnv mType)
       return (flip AuthHookG ty <$> mUrlEnv)
 
     -- Also support HASURA_GRAPHQL_AUTH_HOOK_TYPE
-    -- TODO:- drop this in next major update
+    -- TODO (from master):- drop this in next major update
     authHookTyEnv mType = fromMaybe AHTGet <$>
       withEnv mType "HASURA_GRAPHQL_AUTH_HOOK_TYPE"
 
@@ -314,13 +322,13 @@ serveCmdFooter =
       , jwtSecretEnv, unAuthRoleEnv, corsDomainEnv, corsDisableEnv, enableConsoleEnv
       , enableTelemetryEnv, wsReadCookieEnv, stringifyNumEnv, enabledAPIsEnv
       , enableAllowlistEnv, enabledLogsEnv, logLevelEnv, devModeEnv
-      , adminInternalErrorsEnv
+      , adminInternalErrorsEnv, webSocketKeepAliveEnv
       ]
 
     eventEnvs = [ eventsHttpPoolSizeEnv, eventsFetchIntervalEnv ]
 
 eventsHttpPoolSizeEnv :: (String, String)
-eventsHttpPoolSizeEnv = 
+eventsHttpPoolSizeEnv =
   ( "HASURA_GRAPHQL_EVENTS_HTTP_POOL_SIZE"
   , "Max event threads"
   )
@@ -379,7 +387,7 @@ pgTimeoutEnv =
 pgConnLifetimeEnv :: (String, String)
 pgConnLifetimeEnv =
   ( "HASURA_GRAPHQL_PG_CONN_LIFETIME"
-  , "Time from connection creation after which the connection should be destroyed and a new one " 
+  , "Time from connection creation after which the connection should be destroyed and a new one "
     <> "created. (default: none)"
   )
 
@@ -454,7 +462,7 @@ enableConsoleEnv =
 enableTelemetryEnv :: (String, String)
 enableTelemetryEnv =
   ( "HASURA_GRAPHQL_ENABLE_TELEMETRY"
-  -- TODO: better description
+  -- TODO (from master): better description
   , "Enable anonymous telemetry (default: true)"
   )
 
@@ -506,6 +514,13 @@ devModeEnv =
   ( "HASURA_GRAPHQL_DEV_MODE"
   , "Set dev mode for GraphQL requests; include 'internal' key in the errors extensions (if required) of the response"
   )
+
+enableRemoteSchemaPermsEnv :: (String, String)
+enableRemoteSchemaPermsEnv =
+  ( "HASURA_GRAPHQL_ENABLE_REMOTE_SCHEMA_PERMISSIONS"
+  , "Enables remote schema permissions (default: false)"
+  )
+
 
 adminInternalErrorsEnv :: (String, String)
 adminInternalErrorsEnv =
@@ -822,6 +837,12 @@ parseLogHeadersFromEnv =
            help (snd devModeEnv)
          )
 
+parseEnableRemoteSchemaPerms :: Parser Bool
+parseEnableRemoteSchemaPerms =
+  switch ( long "enable-remote-schema-permissions" <>
+           help (snd enableRemoteSchemaPermsEnv)
+         )
+
 mxRefetchDelayEnv :: (String, String)
 mxRefetchDelayEnv =
   ( "HASURA_GRAPHQL_LIVE_QUERIES_MULTIPLEXED_REFETCH_INTERVAL"
@@ -848,7 +869,7 @@ enableAllowlistEnv =
 --   being 70kb. 128mb per-HEC seems like a reasonable default upper bound
 --   (note there is a distinct stripe per-HEC, for now; so this would give 1GB
 --   for an 8-core machine), which gives us a range of 2,000 to 18,000 here.
---     Analysis of telemetry is hazy here; see 
+--     Analysis of telemetry is hazy here; see
 --   https://github.com/hasura/graphql-engine/issues/5363 for some discussion.
 planCacheSizeEnv :: (String, String)
 planCacheSizeEnv =
@@ -931,9 +952,12 @@ serveOptsToLog so =
       , "enabled_log_types" J..= soEnabledLogTypes so
       , "log_level" J..= soLogLevel so
       , "plan_cache_options" J..= soPlanCacheOptions so
+      , "remote_schema_permissions" J..= soEnableRemoteSchemaPermissions so
+      , "websocket_compression_options" J..= show (WS.connectionCompressionOptions . soConnectionOptions $ so)
+      , "websocket_keep_alive" J..= show (soWebsocketKeepAlive so)
       ]
 
-mkGenericStrLog :: L.LogLevel -> T.Text -> String -> StartupLog
+mkGenericStrLog :: L.LogLevel -> Text -> String -> StartupLog
 mkGenericStrLog logLevel k msg =
   StartupLog logLevel k $ J.toJSON msg
 
@@ -976,6 +1000,9 @@ serveOptionsParser =
   <*> parseGraphqlEventsHttpPoolSize
   <*> parseGraphqlEventsFetchInterval
   <*> parseLogHeadersFromEnv
+  <*> parseEnableRemoteSchemaPerms
+  <*> parseWebSocketCompression
+  <*> parseWebSocketKeepAlive
 
 -- | This implements the mapping between application versions
 -- and catalog schema versions.
@@ -1010,3 +1037,29 @@ downgradeOptionsParser =
         ( long ("to-" <> v) <>
           help ("Downgrade to graphql-engine version " <> v <> " (equivalent to --to-catalog-version " <> catalogVersion <> ")")
         )
+
+webSocketCompressionEnv :: (String, String)
+webSocketCompressionEnv =
+  ( "HASURA_GRAPHQL_CONNECTION_COMPRESSION"
+  , "Enable WebSocket permessage-deflate compression (default: false)"
+  )
+
+parseWebSocketCompression :: Parser Bool
+parseWebSocketCompression =
+  switch ( long "websocket-compression" <>
+           help (snd webSocketCompressionEnv)
+         )
+
+webSocketKeepAliveEnv :: (String, String)
+webSocketKeepAliveEnv =
+  ( "HASURA_GRAPHQL_WEBSOCKET_KEEPALIVE"
+  , "Control websocket keep-alive timeout (default 5 seconds)"
+  )
+
+parseWebSocketKeepAlive :: Parser (Maybe Int)
+parseWebSocketKeepAlive =
+  optional $
+  option (eitherReader readEither)
+         ( long "websocket-keepalive" <>
+           help (snd webSocketKeepAliveEnv)
+         )

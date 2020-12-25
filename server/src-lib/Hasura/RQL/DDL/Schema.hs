@@ -13,8 +13,8 @@ load and modify the Hasura catalog and schema cache.
     representation of the data stored in the catalog. The in-memory representation is not identical
     to the data in the catalog, since it has some post-processing applied to it in order to make it
     easier to consume for other parts of the system, such as GraphQL schema generation. For example,
-    although column information is represented by 'PGRawColumnInfo', the schema cache contains
-    “processed” 'PGColumnInfo' values, instead.
+    although column information is represented by 'RawColumnInfo', the schema cache contains
+    “processed” 'ColumnInfo' values, instead.
 
     Ultimately, the catalog is the source of truth for all information contained in the schema
     cache, but to avoid rebuilding the entire schema cache on every change to the catalog, various
@@ -37,7 +37,6 @@ module Hasura.RQL.DDL.Schema
 
 import           Hasura.Prelude
 
-import qualified Data.Text                      as T
 import qualified Data.Text.Encoding             as TE
 import qualified Database.PG.Query              as Q
 import qualified Database.PostgreSQL.LibPQ      as PQ
@@ -46,7 +45,6 @@ import qualified Text.Regex.TDFA                as TDFA
 import           Data.Aeson
 import           Data.Aeson.Casing
 import           Data.Aeson.TH
-import           Language.Haskell.TH.Syntax     (Lift)
 
 import           Hasura.EncJSON
 import           Hasura.RQL.DDL.Schema.Cache
@@ -64,7 +62,7 @@ data RunSQL
   , rCascade                  :: !Bool
   , rCheckMetadataConsistency :: !(Maybe Bool)
   , rTxAccessMode             :: !Q.TxAccess
-  } deriving (Show, Eq, Lift)
+  } deriving (Show, Eq)
 
 instance FromJSON RunSQL where
   parseJSON = withObject "RunSQL" $ \o -> do
@@ -104,7 +102,7 @@ isSchemaCacheBuildRequiredRunSQL RunSQL {..} =
         { TDFA.captureGroups = False }
         "\\balter\\b|\\bdrop\\b|\\breplace\\b|\\bcreate function\\b|\\bcomment on\\b")
 
-runRunSQL :: (MonadTx m, CacheRWM m, HasSQLGenCtx m) => RunSQL -> m EncJSON
+runRunSQL :: (MonadTx m, CacheRWM m, HasSQLGenCtx m, MetadataM m) => RunSQL -> m EncJSON
 runRunSQL q@RunSQL {..}
   -- see Note [Checking metadata consistency in run_sql]
   | isSchemaCacheBuildRequiredRunSQL q
@@ -153,7 +151,7 @@ instance Q.FromRes RunSQLRes where
     csvRows <- resToCSV res
     return $ RunSQLRes "TuplesOk" $ toJSON csvRows
     where
-      resToCSV :: PQ.Result -> ExceptT T.Text IO [[Text]]
+      resToCSV :: PQ.Result -> ExceptT Text IO [[Text]]
       resToCSV r =  do
         nr  <- liftIO $ PQ.ntuples r
         nc  <- liftIO $ PQ.nfields r
@@ -169,4 +167,4 @@ instance Q.FromRes RunSQLRes where
 
         return $ hdr:rows
 
-      decodeBS = either (throwError . T.pack . show) return . TE.decodeUtf8'
+      decodeBS = either (throwError . tshow) return . TE.decodeUtf8'

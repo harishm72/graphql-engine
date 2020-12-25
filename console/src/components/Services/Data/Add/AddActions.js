@@ -9,10 +9,11 @@ import {
 import { UPDATE_MIGRATION_STATUS_ERROR } from '../../../Main/Actions';
 import { setTable } from '../DataActions.js';
 
-import { isColTypeString, isPostgresFunction } from '../utils';
+import { quoteDefault } from '../utils';
 import { sqlEscapeText } from '../../../Common/utils/sqlUtils';
 import { getRunSqlQuery } from '../../../Common/utils/v1QueryUtils';
 import { getTableModifyRoute } from '../../../Common/utils/routesUtils';
+import Migration from '../../../../utils/migration/Migration';
 
 const SET_DEFAULTS = 'AddTable/SET_DEFAULTS';
 const SET_TABLENAME = 'AddTable/SET_TABLENAME';
@@ -192,15 +193,7 @@ const createTableSql = () => {
         currentCols[i].default !== undefined &&
         currentCols[i].default.value !== ''
       ) {
-        if (
-          isColTypeString(currentCols[i].type) &&
-          !isPostgresFunction(currentCols[i].default.value)
-        ) {
-          // if a column type is text and if it has a non-func default value, add a single quote by default
-          tableDefSql += " DEFAULT '" + currentCols[i].default.value + "'";
-        } else {
-          tableDefSql += ' DEFAULT ' + currentCols[i].default.value;
-        }
+        tableDefSql += ' DEFAULT ' + quoteDefault(currentCols[i].default.value);
 
         if (currentCols[i].type === 'uuid') {
           hasUUIDDefault = true;
@@ -334,39 +327,25 @@ const createTableSql = () => {
 
     // apply migrations
     const migrationName = 'create_table_' + currentSchema + '_' + tableName;
+    const sqlDropTable =
+      'DROP TABLE ' + '"' + currentSchema + '"' + '.' + '"' + tableName + '"';
 
-    // up migration
-    const upQueryArgs = [];
+    const migration = new Migration();
 
     if (hasUUIDDefault) {
       const sqlCreateExtension = 'CREATE EXTENSION IF NOT EXISTS pgcrypto;';
-
-      upQueryArgs.push(getRunSqlQuery(sqlCreateExtension));
+      migration.add(getRunSqlQuery(sqlCreateExtension));
     }
 
-    upQueryArgs.push(getRunSqlQuery(sqlCreateTable));
+    migration.add(getRunSqlQuery(sqlCreateTable), getRunSqlQuery(sqlDropTable));
 
-    upQueryArgs.push({
+    migration.add({
       type: 'add_existing_table_or_view',
       args: {
         name: tableName,
         schema: currentSchema,
       },
     });
-
-    const upQuery = {
-      type: 'bulk',
-      args: upQueryArgs,
-    };
-
-    // down migration
-    const sqlDropTable =
-      'DROP TABLE ' + '"' + currentSchema + '"' + '.' + '"' + tableName + '"';
-
-    const downQuery = {
-      type: 'bulk',
-      args: [getRunSqlQuery(sqlDropTable)],
-    };
 
     // make request
     const requestMsg = 'Creating table...';
@@ -391,8 +370,8 @@ const createTableSql = () => {
     makeMigrationCall(
       dispatch,
       getState,
-      upQuery.args,
-      downQuery.args,
+      migration.upMigration,
+      migration.downMigration,
       migrationName,
       customOnSuccess,
       customOnError,

@@ -226,7 +226,7 @@ class TestUpdateEvtQuery(object):
         assert st_code == 200, resp
         st_code, resp = hge_ctx.v1q_f('queries/event_triggers/update_query/update-setup.yaml')
         assert st_code == 200, '{}'.format(resp)
-        assert resp[1][0]["configuration"]["webhook"] == 'http://127.0.0.1:5592/new'
+        assert resp[1]["tables"][0]["event_triggers"][0]["webhook"] == 'http://127.0.0.1:5592/new'
         yield
         st_code, resp = hge_ctx.v1q_f('queries/event_triggers/update_query/teardown.yaml')
         assert st_code == 200, resp
@@ -534,6 +534,43 @@ class TestWebhookEnv(object):
         st_code, resp = delete(hge_ctx, table, where_exp)
         assert st_code == 200, resp
         check_event(hge_ctx, evts_webhook, "t1_all", table, "DELETE", exp_ev_data)
+
+@usefixtures('per_method_tests_db_state')
+class TestWebhookTemplateURL(object):
+
+    @classmethod
+    def dir(cls):
+        return 'queries/event_triggers/webhook_template_url'
+
+    def test_basic(self, hge_ctx, evts_webhook):
+        table = {"schema": "hge_tests", "name": "test_t1"}
+
+        init_row = {"c1": 1, "c2": "hello"}
+        exp_ev_data = {
+            "old": None,
+            "new": init_row
+        }
+        st_code, resp = insert(hge_ctx, table, init_row)
+        assert st_code == 200, resp
+        check_event(hge_ctx, evts_webhook, "t1_all", table, "INSERT", exp_ev_data, webhook_path = '/trigger')
+
+        where_exp = {"c1": 1}
+        set_exp = {"c2": "world"}
+        exp_ev_data = {
+            "old": init_row,
+            "new": {"c1": 1, "c2": "world"}
+        }
+        st_code, resp = update(hge_ctx, table, where_exp, set_exp)
+        assert st_code == 200, resp
+        check_event(hge_ctx, evts_webhook, "t1_all", table, "UPDATE", exp_ev_data, webhook_path = '/trigger')
+
+        exp_ev_data = {
+            "old": {"c1": 1, "c2": "world"},
+            "new": None
+        }
+        st_code, resp = delete(hge_ctx, table, where_exp)
+        assert st_code == 200, resp
+        check_event(hge_ctx, evts_webhook, "t1_all", table, "DELETE", exp_ev_data, webhook_path = '/trigger')
 
 @usefixtures('per_method_tests_db_state')
 class TestSessionVariables(object):

@@ -40,6 +40,8 @@ import { showErrorNotification } from './components/Services/Common/Notification
 import { CLI_CONSOLE_MODE } from './constants';
 import UIKit from './components/UIKit/';
 import { Heading } from './components/UIKit/atoms';
+import { SupportContainer } from './components/Services/Support/SupportContainer';
+import HelpPage from './components/Services/Support/HelpPage';
 
 const routes = store => {
   // load hasuractl migration status
@@ -71,7 +73,6 @@ const routes = store => {
 
     return;
   };
-
   const _dataRouterUtils = dataRouterUtils(connect, store, composeOnEnterHooks);
   const requireSchema = _dataRouterUtils.requireSchema;
   const dataRouter = _dataRouterUtils.makeDataRouter;
@@ -103,16 +104,17 @@ const routes = store => {
     <Route
       path="/"
       component={App}
-      onEnter={composeOnEnterHooks([
-        validateLogin(store),
-        requireAsyncGlobals(store),
-      ])}
+      onEnter={composeOnEnterHooks([validateLogin(store)])}
     >
       <Route path="login" component={generatedLoginConnector(connect)} />
       <Route
         path=""
         component={Main}
-        onEnter={composeOnEnterHooks([requireSchema, requireMigrationStatus])}
+        onEnter={composeOnEnterHooks([
+          requireSchema,
+          requireMigrationStatus,
+          requireAsyncGlobals(store),
+        ])}
       >
         <Route path="">
           <IndexRoute component={generatedApiExplorer(connect)} />
@@ -146,6 +148,9 @@ const routes = store => {
           {actionsRouter}
           {eventsRouter}
           {uiKitRouter}
+          <Route path="support" component={SupportContainer}>
+            <Route path="forums" component={HelpPage} />
+          </Route>
         </Route>
       </Route>
       <Route path="404" component={PageNotFound} status="404" />
