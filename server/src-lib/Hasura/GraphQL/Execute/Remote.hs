@@ -1,5 +1,6 @@
 module Hasura.GraphQL.Execute.Remote
   ( buildExecStepRemote
+  , collectVariablesFromSelectionSet
   , collectVariables
   , resolveRemoteVariable
   , resolveRemoteField
@@ -8,8 +9,8 @@ module Hasura.GraphQL.Execute.Remote
 import           Hasura.Prelude
 
 import qualified Data.Aeson                             as J
-import qualified Data.HashSet                           as Set
 import qualified Data.HashMap.Strict                    as Map
+import qualified Data.HashSet                           as Set
 import qualified Data.Text                              as T
 import qualified Language.GraphQL.Draft.Syntax          as G
 
@@ -17,12 +18,13 @@ import           Data.Text.Extended
 
 import qualified Hasura.GraphQL.Transport.HTTP.Protocol as GH
 
+import           Hasura.GraphQL.Context                 (RemoteField, RemoteFieldG (..))
 import           Hasura.GraphQL.Execute.Prepare
 import           Hasura.GraphQL.Parser
-import           Hasura.GraphQL.Context                 (RemoteFieldG (..), RemoteField)
+import           Hasura.GraphQL.Transport.HTTP.Protocol
 import           Hasura.RQL.Types
-
 import           Hasura.Session
+
 
 mkVariableDefinitionAndValue :: Variable -> (G.VariableDefinition, (G.Name, J.Value))
 mkVariableDefinitionAndValue var@(Variable varInfo gType varValue) =
@@ -34,12 +36,12 @@ mkVariableDefinitionAndValue var@(Variable varInfo gType varValue) =
 
     defaultVal =
       case varInfo of
-        VIRequired _ -> Nothing
+        VIRequired _     -> Nothing
         VIOptional _ val -> Just val
 
     varJSONValue =
       case varValue of
-        JSONValue v -> v
+        JSONValue v      -> v
         GraphQLValue val -> graphQLValueToJSON val
 
 unresolveVariables
@@ -58,12 +60,18 @@ collectVariables
 collectVariables =
   Set.unions . fmap (foldMap Set.singleton)
 
+collectVariablesFromSelectionSet
+  :: G.SelectionSet G.NoFragments Variable
+  -> [(G.VariableDefinition, (G.Name, J.Value))]
+collectVariablesFromSelectionSet =
+  map mkVariableDefinitionAndValue . Set.toList . collectVariables
+
+
 buildExecStepRemote
-  :: forall db
-  .  RemoteSchemaInfo
+  :: RemoteSchemaInfo
   -> G.OperationType
   -> G.SelectionSet G.NoFragments Variable
-  -> ExecutionStep db
+  -> ExecutionStep
 buildExecStepRemote remoteSchemaInfo tp selSet =
   let unresolvedSelSet = unresolveVariables selSet
       allVars = map mkVariableDefinitionAndValue $ Set.toList $ collectVariables selSet

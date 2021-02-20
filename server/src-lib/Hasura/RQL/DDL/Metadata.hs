@@ -1,38 +1,39 @@
 module Hasura.RQL.DDL.Metadata
   ( runReplaceMetadata
+  , runReplaceMetadataV2
   , runExportMetadata
+  , runExportMetadataV2
   , runClearMetadata
   , runReloadMetadata
   , runDumpInternalState
   , runGetInconsistentMetadata
   , runDropInconsistentMetadata
+  , runGetCatalogState
+  , runSetCatalogState
+
+  , runSetMetricsConfig
+  , runRemoveMetricsConfig
 
   , module Hasura.RQL.DDL.Metadata.Types
   ) where
 
 import           Hasura.Prelude
 
--- <<<<<<< HEAD TODO: karthikeyan
--- import qualified Data.Aeson.Ordered                 as AO
--- import qualified Data.HashMap.Strict                as HM
--- import qualified Data.HashMap.Strict.InsOrd         as HMIns
--- import qualified Data.HashSet                       as HS
--- import qualified Data.HashSet.InsOrd                as HSIns
--- import qualified Data.List                          as L
--- import qualified Database.PG.Query                  as Q
--- import           Data.Text.NonEmpty
--- =======
-import qualified Data.Aeson.Ordered                as AO
-import qualified Data.HashMap.Strict.InsOrd        as OMap
-import qualified Data.HashSet                      as HS
-import qualified Data.List                         as L
--- >>>>>>> main
+import qualified Data.Aeson.Ordered                 as AO
+import qualified Data.HashMap.Strict                as HM
+import qualified Data.HashMap.Strict.InsOrd         as OMap
+import qualified Data.HashSet                       as HS
+import qualified Data.List                          as L
 
+import           Control.Lens                       ((.~), (^?))
 import           Data.Aeson
 
+import           Hasura.Backends.Postgres.DDL.Table (delTriggerQ)
+import           Hasura.Metadata.Class
 import           Hasura.RQL.DDL.Action
 import           Hasura.RQL.DDL.ComputedField
 import           Hasura.RQL.DDL.CustomTypes
+import           Hasura.RQL.DDL.Endpoint
 import           Hasura.RQL.DDL.EventTrigger
 import           Hasura.RQL.DDL.Permission
 import           Hasura.RQL.DDL.Relationship
@@ -46,10 +47,24 @@ import           Hasura.RQL.DDL.Metadata.Types
 import           Hasura.RQL.Types
 
 runClearMetadata
-  :: (CacheRWM m, MetadataM m, MonadTx m)
+  :: (MonadIO m, CacheRWM m, MetadataM m, MonadError QErr m)
   => ClearMetadata -> m EncJSON
 runClearMetadata _ = do
-  runReplaceMetadata emptyMetadata
+  metadata <- getMetadata
+  -- We can infer whether the server is started with `--database-url` option
+  -- (or corresponding env variable) by checking the existence of @'defaultSource'
+  -- in current metadata.
+  let maybeDefaultSourceMetadata = metadata ^? metaSources.ix defaultSource
+      emptyMetadata' = case maybeDefaultSourceMetadata of
+          Nothing -> emptyMetadata
+          Just (BackendSourceMetadata defaultSourceMetadata) ->
+            -- If default postgres source is defined, we need to set metadata
+            -- which contains only default source without any tables and functions.
+            let emptyDefaultSource = BackendSourceMetadata $
+                  SourceMetadata defaultSource mempty mempty $ _smConfiguration defaultSourceMetadata
+            in emptyMetadata
+               & metaSources %~ OMap.insert defaultSource emptyDefaultSource
+  runReplaceMetadataV1 $ RMWithSources emptyMetadata'
 
 {- Note [Clear postgres schema for dropped triggers]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -67,36 +82,99 @@ runReplaceMetadata
   :: ( QErrM m
      , CacheRWM m
      , MetadataM m
-     , MonadTx m
+     , MonadIO m
      )
-  => Metadata -> m EncJSON
-runReplaceMetadata metadata = do
-  oldMetadata <- getMetadata
-  putMetadata metadata
-  buildSchemaCacheStrict
-  -- See Note [Clear postgres schema for dropped triggers]
-  let getTriggersMap = OMap.unions . map _tmEventTriggers . OMap.elems . _metaTables
-      oldTriggersMap = getTriggersMap oldMetadata
-      newTriggersMap = getTriggersMap metadata
-      droppedTriggers = OMap.keys $ oldTriggersMap `OMap.difference` newTriggersMap
-  for_ droppedTriggers $ \name -> liftTx $ delTriggerQ name >> archiveEvents name
+  => ReplaceMetadata -> m EncJSON
+runReplaceMetadata = \case
+  RMReplaceMetadataV1 v1args -> runReplaceMetadataV1 v1args
+  RMReplaceMetadataV2 v2args -> runReplaceMetadataV2 v2args
 
-  pure successMsg
+runReplaceMetadataV1
+  :: ( QErrM m
+     , CacheRWM m
+     , MetadataM m
+     , MonadIO m
+     )
+  => ReplaceMetadataV1 -> m EncJSON
+runReplaceMetadataV1 =
+  (successMsg <$) . runReplaceMetadataV2 . ReplaceMetadataV2 NoAllowInconsistentMetadata
+
+runReplaceMetadataV2
+  :: ( QErrM m
+     , CacheRWM m
+     , MetadataM m
+     , MonadIO m
+     )
+  => ReplaceMetadataV2 -> m EncJSON
+runReplaceMetadataV2 ReplaceMetadataV2{..} = do
+  oldMetadata <- getMetadata
+  metadata <- case _rmv2Metadata of
+    RMWithSources m -> pure m
+    RMWithoutSources MetadataNoSources{..} -> do
+      let maybeDefaultSourceMetadata = oldMetadata ^? metaSources.ix defaultSource.toSourceMetadata
+      defaultSourceMetadata <- onNothing maybeDefaultSourceMetadata $
+        throw400 NotSupported $ "cannot import metadata without sources since no default source is defined"
+      let newDefaultSourceMetadata = BackendSourceMetadata defaultSourceMetadata
+                                     { _smTables = _mnsTables
+                                     , _smFunctions = _mnsFunctions
+                                     }
+      pure $ Metadata (OMap.singleton defaultSource newDefaultSourceMetadata)
+                        _mnsRemoteSchemas _mnsQueryCollections _mnsAllowlist
+                        _mnsCustomTypes _mnsActions _mnsCronTriggers (_metaRestEndpoints oldMetadata)
+                        emptyApiLimit emptyMetricsConfig
+  putMetadata metadata
+
+  case _rmv2AllowInconsistentMetadata of
+    AllowInconsistentMetadata ->
+      buildSchemaCache noMetadataModify
+    NoAllowInconsistentMetadata ->
+      buildSchemaCacheStrict
+
+  -- See Note [Clear postgres schema for dropped triggers]
+  for_ (OMap.toList $ _metaSources metadata) $ \(source, newSourceCache) ->
+    onJust (OMap.lookup source $ _metaSources oldMetadata) $ \oldSourceCache -> do
+      let getTriggersMap (BackendSourceMetadata sm) =
+            (OMap.unions . map _tmEventTriggers . OMap.elems . _smTables) sm
+          oldTriggersMap = getTriggersMap oldSourceCache
+          newTriggersMap = getTriggersMap newSourceCache
+          droppedTriggers = OMap.keys $ oldTriggersMap `OMap.difference` newTriggersMap
+      sourceConfig <- askSourceConfig source
+      for_ droppedTriggers $
+        \name -> liftIO $ runPgSourceWriteTx sourceConfig $ delTriggerQ name >> archiveEvents name
+
+  sc <- askSchemaCache
+  pure $ encJFromJValue $ formatInconsistentObjs $ scInconsistentObjs sc
+
 
 runExportMetadata
-  :: (MetadataM m)
+  :: forall m . ( QErrM m, MetadataM m)
   => ExportMetadata -> m EncJSON
-runExportMetadata _ =
+runExportMetadata ExportMetadata{} =
   AO.toEncJSON . metadataToOrdJSON <$> getMetadata
 
+runExportMetadataV2
+  :: forall m . ( QErrM m, MetadataM m)
+  => MetadataResourceVersion -> ExportMetadata -> m EncJSON
+runExportMetadataV2 currentResourceVersion ExportMetadata{} = do
+  exportMetadata <- getMetadata
+  pure $ AO.toEncJSON $ AO.object
+    [ ("resource_version", AO.toOrdered currentResourceVersion)
+    , ("metadata", metadataToOrdJSON exportMetadata)
+    ]
+
 runReloadMetadata :: (QErrM m, CacheRWM m, MetadataM m) => ReloadMetadata -> m EncJSON
-runReloadMetadata (ReloadMetadata reloadRemoteSchemas) = do
+runReloadMetadata (ReloadMetadata reloadRemoteSchemas reloadSources) = do
   sc <- askSchemaCache
-  let remoteSchemaInvalidations =
-        if reloadRemoteSchemas then HS.fromList (getAllRemoteSchemas sc) else mempty
+  let remoteSchemaInvalidations = case reloadRemoteSchemas of
+        RSReloadAll    -> HS.fromList $ getAllRemoteSchemas sc
+        RSReloadList l -> l
+      pgSourcesInvalidations = case reloadSources of
+        RSReloadAll    -> HS.fromList $ HM.keys $ scPostgres sc
+        RSReloadList l -> l
       cacheInvalidations = CacheInvalidations
                            { ciMetadata = True
                            , ciRemoteSchemas = remoteSchemaInvalidations
+                           , ciSources = pgSourcesInvalidations
                            }
   metadata <- getMetadata
   buildSchemaCacheWithOptions CatalogUpdate cacheInvalidations metadata
@@ -114,10 +192,13 @@ runGetInconsistentMetadata
   => GetInconsistentMetadata -> m EncJSON
 runGetInconsistentMetadata _ = do
   inconsObjs <- scInconsistentObjs <$> askSchemaCache
-  return $ encJFromJValue $ object
-                [ "is_consistent" .= null inconsObjs
-                , "inconsistent_objects" .= inconsObjs
-                ]
+  return $ encJFromJValue $ formatInconsistentObjs inconsObjs
+
+formatInconsistentObjs :: [InconsistentMetadata] -> Value
+formatInconsistentObjs inconsObjs = object
+  [ "is_consistent" .= null inconsObjs
+  , "inconsistent_objects" .= inconsObjs
+  ]
 
 runDropInconsistentMetadata
   :: (QErrM m, CacheRWM m, MetadataM m)
@@ -137,19 +218,55 @@ runDropInconsistentMetadata _ = do
 
 purgeMetadataObj :: MetadataObjId -> MetadataModifier
 purgeMetadataObj = \case
-  MOTable qt                                 -> dropTableInMetadata qt
-  MOTableObj qt tableObj                     ->
-    MetadataModifier $
-    metaTables.ix qt %~ case tableObj of
-        MTORel rn _              -> dropRelationshipInMetadata rn
-        MTOPerm rn pt            -> dropPermissionInMetadata rn pt
-        MTOTrigger trn           -> dropEventTriggerInMetadata trn
-        MTOComputedField ccn     -> dropComputedFieldInMetadata ccn
-        MTORemoteRelationship rn -> dropRemoteRelationshipInMetadata rn
-  MOFunction qf                              -> dropFunctionInMetadata qf
+  MOSource source -> MetadataModifier $ metaSources %~ OMap.delete source
+  MOSourceObjId source (sourceObjId :: SourceMetadataObjId b) ->
+    case backendTag @b of
+      PostgresTag -> case sourceObjId of
+        SMOTable qt                                 -> dropTableInMetadata source qt
+        SMOTableObj qt tableObj -> MetadataModifier $
+          tableMetadataSetter source qt %~ case tableObj of
+            MTORel rn _              -> dropRelationshipInMetadata rn
+            MTOPerm rn pt            -> dropPermissionInMetadata rn pt
+            MTOTrigger trn           -> dropEventTriggerInMetadata trn
+            MTOComputedField ccn     -> dropComputedFieldInMetadata ccn
+            MTORemoteRelationship rn -> dropRemoteRelationshipInMetadata rn
+        SMOFunction qf                           -> dropFunctionInMetadata source qf
+        SMOFunctionPermission qf rn              -> dropFunctionPermissionInMetadata source qf rn
   MORemoteSchema rsn                         -> dropRemoteSchemaInMetadata rsn
   MORemoteSchemaPermissions rsName role      -> dropRemoteSchemaPermissionInMetadata rsName role
   MOCustomTypes                              -> clearCustomTypesInMetadata
-  MOAction action                            -> dropActionInMetadata action
+  MOAction action                            -> dropActionInMetadata action -- Nothing
   MOActionPermission action role             -> dropActionPermissionInMetadata action role
   MOCronTrigger ctName                       -> dropCronTriggerInMetadata ctName
+  MOEndpoint epName                          -> dropEndpointInMetadata epName
+
+runGetCatalogState
+  :: (MonadMetadataStorageQueryAPI m) => GetCatalogState -> m EncJSON
+runGetCatalogState _ =
+  encJFromJValue <$> fetchCatalogState
+
+runSetCatalogState
+  :: (MonadMetadataStorageQueryAPI m) => SetCatalogState -> m EncJSON
+runSetCatalogState SetCatalogState{..} = do
+  updateCatalogState _scsType _scsState
+  pure successMsg
+
+runSetMetricsConfig
+  :: (MonadIO m, CacheRWM m, MetadataM m, MonadError QErr m)
+  => MetricsConfig -> m EncJSON
+runSetMetricsConfig mc = do
+  withNewInconsistentObjsCheck
+    $ buildSchemaCache
+    $ MetadataModifier
+    $ metaMetricsConfig .~ mc
+  pure successMsg
+
+runRemoveMetricsConfig
+  :: (MonadIO m, CacheRWM m, MetadataM m, MonadError QErr m)
+  => m EncJSON
+runRemoveMetricsConfig = do
+  withNewInconsistentObjsCheck
+    $ buildSchemaCache
+    $ MetadataModifier
+    $ metaMetricsConfig .~ emptyMetricsConfig
+  pure successMsg

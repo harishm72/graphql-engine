@@ -20,7 +20,7 @@ that can be used to either encapsulate some custom business logic or extend the 
 are also referred to as **stored procedures**.
 
 Hasura GraphQL engine lets you expose certain types of custom functions as top level fields in the GraphQL API to allow
-querying them as either ``queries`` or ``subscriptions``, or (for ``VOLATILE`` functions) as ``mutations``.
+querying them with either ``queries`` or ``subscriptions``, or for ``VOLATILE`` functions as ``mutations``.
 
 .. note::
 
@@ -34,8 +34,9 @@ Supported SQL functions
 Currently, only functions which satisfy the following constraints can be exposed as top level fields in the GraphQL API
 (*terminology from* `Postgres docs <https://www.postgresql.org/docs/current/sql-createfunction.html>`__):
 
-- **Function behaviour**: ``STABLE`` or ``IMMUTABLE`` functions may *only* be exposed as queries (i.e. with ``exposed_as: query``)
-- **Return type**: MUST be ``SETOF <table-name>`` where ``<table-name>`` is already tracked
+- **Function behaviour**: ``STABLE`` or ``IMMUTABLE`` functions may *only* be exposed as queries. 
+  ``VOLATILE`` functions may be exposed as mutations or queries. 
+- **Return type**: MUST be ``SETOF <table-name>`` OR ``<table-name>`` where ``<table-name>`` is already tracked
 - **Argument modes**: ONLY ``IN``
 
 .. _create_sql_functions:
@@ -159,23 +160,23 @@ Let's take a look at an example where the ``SETOF`` table is already part of the
 
 .. code-block:: plpgsql
 
-  article(id integer, title text, content text)
+  articles(id integer, title text, content text)
 
 Let's say we've created and tracked a custom function, ``search_articles``, with the following definition:
 
 .. code-block:: plpgsql
 
   CREATE FUNCTION search_articles(search text)
-  RETURNS SETOF article AS $$
+  RETURNS SETOF articles AS $$
       SELECT *
-      FROM article
+      FROM articles
       WHERE
         title ilike ('%' || search || '%')
         OR content ilike ('%' || search || '%')
   $$ LANGUAGE sql STABLE;
 
-This function filters rows from the ``article`` table based on the input text argument, ``search`` i.e. it
-returns ``SETOF article``. Assuming the ``article`` table is being tracked, you can use the custom function
+This function filters rows from the ``articles`` table based on the input text argument, ``search`` i.e. it
+returns ``SETOF articles``. Assuming the ``articles`` table is being tracked, you can use the custom function
 as follows:
 
 .. graphiql::
@@ -223,17 +224,17 @@ Next create a GIN (or GIST) index in your database for the columns you'll be que
 
 .. code-block:: sql
 
-  CREATE INDEX address_gin_idx ON property
+  CREATE INDEX address_gin_idx ON properties
   USING GIN ((unit || ' ' || num || ' ' || street || ' ' || city || ' ' || region || ' ' || postcode) gin_trgm_ops);
 
 And finally create the custom SQL function in the Hasura console:
 
 .. code-block:: plpgsql
 
-  CREATE FUNCTION search_property(search text)
-  RETURNS SETOF property AS $$
+  CREATE FUNCTION search_properties(search text)
+  RETURNS SETOF properties AS $$
       SELECT *
-      FROM property
+      FROM properties
       WHERE
         search <% (unit || ' ' || num || ' ' || street || ' ' || city || ' ' || region || ' ' || postcode)
       ORDER BY
@@ -241,13 +242,13 @@ And finally create the custom SQL function in the Hasura console:
       LIMIT 5;
   $$ LANGUAGE sql STABLE;
 
-Assuming the ``property`` table is being tracked, you can use the custom function as follows:
+Assuming the ``properties`` table is being tracked, you can use the custom function as follows:
 
 .. graphiql::
   :view_only:
   :query:
     query {
-      search_property(
+      search_properties(
         args: {search: "Unit 2, 25 Foobar St, Sydney NSW 2000"}
       ){
         id
@@ -262,7 +263,7 @@ Assuming the ``property`` table is being tracked, you can use the custom functio
   :response:
     {
       "data": {
-        "search_property": [
+        "search_properties": [
           {
             "id": 1,
             "unit": "UNIT 2",
@@ -575,11 +576,22 @@ visible only to administrators.
    function to end up with ``VOLATILE`` mistakenly, since it's the default).
 
 
-Permissions for custom function queries
----------------------------------------
+Permissions for custom functions
+--------------------------------
+
+A custom function ``f`` is only accessible to a role ``r`` if there is a function permission (see :ref:`Create function permission <pg_create_function_permission>`) defined on the function ``f`` for the role ``r``. Additionally, role ``r`` must have SELECT permissions on the returning table of the function ``f``.
 
 :ref:`Access control permissions <permission_rules>` configured for the ``SETOF`` table of a function are also applicable to the function itself.
 
-**For example**, in our text-search example above, if the role ``user`` doesn't have the requisite permissions to view
-the table ``article``, a validation error will be thrown if the ``search_articles`` query is run using the ``user``
-role.
+.. TODO: add setting fn permission section (API, CLI, Console)
+
+**For example**, in our text-search example above, if the role ``user`` has access only to certain columns of
+the table ``article``, a validation error will be thrown if the ``search_articles`` query is run selecting a column
+to which the ``user`` role doesn't have access to.
+
+.. note::
+
+   In case of **functions exposed as queries**, if the Hasura GraphQL engine is started with inferring of function permissions
+   set to ``true`` (by default: ``true``) then a function exposed as a query will be accessible to a role even
+   if the role doesn't have a function permission for the function - provided the role has select permission defined
+   on the returning table of the function.

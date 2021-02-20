@@ -5,7 +5,7 @@ module Hasura.Metadata.Class
   , MetadataStorageT(..)
   , runMetadataStorageT
   , MonadMetadataStorage(..)
-  , MonadScheduledEvents(..)
+  , MonadMetadataStorageQueryAPI(..)
   )
 where
 
@@ -79,10 +79,18 @@ TODO: Reference to open issue or rfc?
 class (MonadError QErr m) => MonadMetadataStorage m where
 
   -- Metadata
-  fetchMetadata :: m Metadata
-  setMetadata :: Metadata -> m ()
+  fetchMetadata :: m (Metadata, MetadataResourceVersion)
+  setMetadata :: MetadataResourceVersion -> Metadata -> m ()
   notifySchemaCacheSync :: InstanceId -> CacheInvalidations -> m ()
   processSchemaSyncEventPayload :: InstanceId -> Value -> m SchemaSyncEventProcessResult
+  getCatalogState :: m CatalogState
+  -- the `setCatalogState` function is used by the console and CLI to store its state
+  -- it is disabled when maintenance mode is on
+  setCatalogState :: CatalogStateType -> Value -> m ()
+
+  -- get the @db_uuid@ that we store in the database.
+  getDatabaseUid :: m Text
+  checkMetadataStorageHealth  :: m Bool
 
   -- Scheduled triggers
   -- TODO:-
@@ -99,6 +107,11 @@ class (MonadError QErr m) => MonadMetadataStorage m where
   unlockScheduledEvents :: ScheduledEventType -> [ScheduledEventId] -> m Int
   unlockAllLockedScheduledEvents :: m ()
   clearFutureCronEvents :: TriggerName -> m ()
+  -- Console API requirements
+  getOneOffScheduledEvents :: ScheduledEventPagination -> [ScheduledEventStatus] -> m (WithTotalCount [OneOffScheduledEvent])
+  getCronEvents :: TriggerName -> ScheduledEventPagination -> [ScheduledEventStatus] -> m (WithTotalCount [CronEvent])
+  getInvocations :: GetInvocationsBy -> ScheduledEventPagination -> m (WithTotalCount [ScheduledEventInvocation])
+  deleteScheduledEvent :: ScheduledEventId -> ScheduledEventType -> m ()
 
   -- Async actions
   insertAction
@@ -107,106 +120,163 @@ class (MonadError QErr m) => MonadMetadataStorage m where
   fetchUndeliveredActionEvents :: m [ActionLogItem]
   setActionStatus :: ActionId -> AsyncActionStatus -> m ()
   fetchActionResponse :: ActionId -> m ActionLogResponse
+  clearActionData :: ActionName -> m ()
 
 instance (MonadMetadataStorage m) => MonadMetadataStorage (ReaderT r m) where
-  fetchMetadata                     = lift fetchMetadata
-  setMetadata                       = lift . setMetadata
-  notifySchemaCacheSync a b         = lift $ notifySchemaCacheSync a b
-  processSchemaSyncEventPayload a b = lift $ processSchemaSyncEventPayload a b
+  fetchMetadata                        = lift fetchMetadata
+  setMetadata r                        = lift . setMetadata r
+  notifySchemaCacheSync a b            = lift $ notifySchemaCacheSync a b
+  processSchemaSyncEventPayload a b    = lift $ processSchemaSyncEventPayload a b
+  getCatalogState                      = lift getCatalogState
+  setCatalogState a b                  = lift $ setCatalogState a b
 
-  getDeprivedCronTriggerStats        = lift getDeprivedCronTriggerStats
-  getScheduledEventsForDelivery      = lift getScheduledEventsForDelivery
-  insertScheduledEvent               = lift . insertScheduledEvent
-  insertScheduledEventInvocation a b = lift $ insertScheduledEventInvocation a b
-  setScheduledEventOp a b c          = lift $ setScheduledEventOp a b c
-  unlockScheduledEvents a b          = lift $ unlockScheduledEvents a b
-  unlockAllLockedScheduledEvents     = lift unlockAllLockedScheduledEvents
-  clearFutureCronEvents              = lift . clearFutureCronEvents
+  getDatabaseUid                       = lift getDatabaseUid
+  checkMetadataStorageHealth           = lift checkMetadataStorageHealth
 
-  insertAction a b c d         = lift $ insertAction a b c d
-  fetchUndeliveredActionEvents = lift fetchUndeliveredActionEvents
-  setActionStatus a b          = lift $ setActionStatus a b
-  fetchActionResponse          = lift . fetchActionResponse
+  getDeprivedCronTriggerStats          = lift getDeprivedCronTriggerStats
+  getScheduledEventsForDelivery        = lift getScheduledEventsForDelivery
+  insertScheduledEvent                 = lift . insertScheduledEvent
+  insertScheduledEventInvocation a b   = lift $ insertScheduledEventInvocation a b
+  setScheduledEventOp a b c            = lift $ setScheduledEventOp a b c
+  unlockScheduledEvents a b            = lift $ unlockScheduledEvents a b
+  unlockAllLockedScheduledEvents       = lift $ unlockAllLockedScheduledEvents
+  clearFutureCronEvents                = lift . clearFutureCronEvents
+  getOneOffScheduledEvents a b         = lift $ getOneOffScheduledEvents a b
+  getCronEvents a b c                  = lift $ getCronEvents a b c
+  getInvocations a b                   = lift $ getInvocations a b
+  deleteScheduledEvent a b             = lift $ deleteScheduledEvent a b
+
+
+  insertAction a b c d                 = lift $ insertAction a b c d
+  fetchUndeliveredActionEvents         = lift fetchUndeliveredActionEvents
+  setActionStatus a b                  = lift $ setActionStatus a b
+  fetchActionResponse                  = lift . fetchActionResponse
+  clearActionData                      = lift . clearActionData
 
 instance (MonadMetadataStorage m) => MonadMetadataStorage (StateT s m) where
-  fetchMetadata                     = lift fetchMetadata
-  setMetadata                       = lift . setMetadata
-  notifySchemaCacheSync a b         = lift $ notifySchemaCacheSync a b
-  processSchemaSyncEventPayload a b = lift $ processSchemaSyncEventPayload a b
+  fetchMetadata                        = lift fetchMetadata
+  setMetadata r                        = lift . setMetadata r
+  notifySchemaCacheSync a b            = lift $ notifySchemaCacheSync a b
+  processSchemaSyncEventPayload a b    = lift $ processSchemaSyncEventPayload a b
+  getCatalogState                      = lift getCatalogState
+  setCatalogState a b                  = lift $ setCatalogState a b
 
-  getDeprivedCronTriggerStats        = lift getDeprivedCronTriggerStats
-  getScheduledEventsForDelivery      = lift getScheduledEventsForDelivery
-  insertScheduledEvent               = lift . insertScheduledEvent
-  insertScheduledEventInvocation a b = lift $ insertScheduledEventInvocation a b
-  setScheduledEventOp a b c          = lift $ setScheduledEventOp a b c
-  unlockScheduledEvents a b          = lift $ unlockScheduledEvents a b
-  unlockAllLockedScheduledEvents     = lift unlockAllLockedScheduledEvents
-  clearFutureCronEvents              = lift . clearFutureCronEvents
+  getDatabaseUid                       = lift getDatabaseUid
+  checkMetadataStorageHealth           = lift checkMetadataStorageHealth
 
-  insertAction a b c d         = lift $ insertAction a b c d
-  fetchUndeliveredActionEvents = lift fetchUndeliveredActionEvents
-  setActionStatus a b          = lift $ setActionStatus a b
-  fetchActionResponse          = lift . fetchActionResponse
+  getDeprivedCronTriggerStats          = lift getDeprivedCronTriggerStats
+  getScheduledEventsForDelivery        = lift getScheduledEventsForDelivery
+  insertScheduledEvent                 = lift . insertScheduledEvent
+  insertScheduledEventInvocation a b   = lift $ insertScheduledEventInvocation a b
+  setScheduledEventOp a b c            = lift $ setScheduledEventOp a b c
+  unlockScheduledEvents a b            = lift $ unlockScheduledEvents a b
+  unlockAllLockedScheduledEvents       = lift $ unlockAllLockedScheduledEvents
+  clearFutureCronEvents                = lift . clearFutureCronEvents
+  getOneOffScheduledEvents a b         = lift $ getOneOffScheduledEvents a b
+  getCronEvents a b c                  = lift $ getCronEvents a b c
+  getInvocations a b                   = lift $ getInvocations a b
+  deleteScheduledEvent a b             = lift $ deleteScheduledEvent a b
+
+
+  insertAction a b c d                 = lift $ insertAction a b c d
+  fetchUndeliveredActionEvents         = lift fetchUndeliveredActionEvents
+  setActionStatus a b                  = lift $ setActionStatus a b
+  fetchActionResponse                  = lift . fetchActionResponse
+  clearActionData                      = lift . clearActionData
+
 
 instance (MonadMetadataStorage m) => MonadMetadataStorage (Tracing.TraceT m) where
-  fetchMetadata                     = lift fetchMetadata
-  setMetadata                       = lift . setMetadata
-  notifySchemaCacheSync a b         = lift $ notifySchemaCacheSync a b
-  processSchemaSyncEventPayload a b = lift $ processSchemaSyncEventPayload a b
+  fetchMetadata                        = lift fetchMetadata
+  setMetadata r                        = lift . setMetadata r
+  notifySchemaCacheSync a b            = lift $ notifySchemaCacheSync a b
+  processSchemaSyncEventPayload a b    = lift $ processSchemaSyncEventPayload a b
+  getCatalogState                      = lift getCatalogState
+  setCatalogState a b                  = lift $ setCatalogState a b
 
-  getDeprivedCronTriggerStats        = lift getDeprivedCronTriggerStats
-  getScheduledEventsForDelivery      = lift getScheduledEventsForDelivery
-  insertScheduledEvent               = lift . insertScheduledEvent
-  insertScheduledEventInvocation a b = lift $ insertScheduledEventInvocation a b
-  setScheduledEventOp a b c          = lift $ setScheduledEventOp a b c
-  unlockScheduledEvents a b          = lift $ unlockScheduledEvents a b
-  unlockAllLockedScheduledEvents     = lift unlockAllLockedScheduledEvents
-  clearFutureCronEvents              = lift . clearFutureCronEvents
+  getDatabaseUid                       = lift getDatabaseUid
+  checkMetadataStorageHealth           = lift checkMetadataStorageHealth
 
-  insertAction a b c d         = lift $ insertAction a b c d
-  fetchUndeliveredActionEvents = lift fetchUndeliveredActionEvents
-  setActionStatus a b          = lift $ setActionStatus a b
-  fetchActionResponse          = lift . fetchActionResponse
+  getDeprivedCronTriggerStats          = lift getDeprivedCronTriggerStats
+  getScheduledEventsForDelivery        = lift getScheduledEventsForDelivery
+  insertScheduledEvent                 = lift . insertScheduledEvent
+  insertScheduledEventInvocation a b   = lift $ insertScheduledEventInvocation a b
+  setScheduledEventOp a b c            = lift $ setScheduledEventOp a b c
+  unlockScheduledEvents a b            = lift $ unlockScheduledEvents a b
+  unlockAllLockedScheduledEvents       = lift $ unlockAllLockedScheduledEvents
+  clearFutureCronEvents                = lift . clearFutureCronEvents
+  getOneOffScheduledEvents a b         = lift $ getOneOffScheduledEvents a b
+  getCronEvents a b c                  = lift $ getCronEvents a b c
+  getInvocations a b                   = lift $ getInvocations a b
+  deleteScheduledEvent a b             = lift $ deleteScheduledEvent a b
 
-instance (MonadMetadataStorage m) => MonadMetadataStorage (LazyTxT QErr m) where
-  fetchMetadata                     = lift fetchMetadata
-  setMetadata                       = lift . setMetadata
-  notifySchemaCacheSync a b         = lift $ notifySchemaCacheSync a b
-  processSchemaSyncEventPayload a b = lift $ processSchemaSyncEventPayload a b
 
-  getDeprivedCronTriggerStats        = lift getDeprivedCronTriggerStats
-  getScheduledEventsForDelivery      = lift getScheduledEventsForDelivery
-  insertScheduledEvent               = lift . insertScheduledEvent
-  insertScheduledEventInvocation a b = lift $ insertScheduledEventInvocation a b
-  setScheduledEventOp a b c          = lift $ setScheduledEventOp a b c
-  unlockScheduledEvents a b          = lift $ unlockScheduledEvents a b
-  unlockAllLockedScheduledEvents     = lift unlockAllLockedScheduledEvents
-  clearFutureCronEvents              = lift . clearFutureCronEvents
+  insertAction a b c d                 = lift $ insertAction a b c d
+  fetchUndeliveredActionEvents         = lift fetchUndeliveredActionEvents
+  setActionStatus a b                  = lift $ setActionStatus a b
+  fetchActionResponse                  = lift . fetchActionResponse
+  clearActionData                      = lift . clearActionData
 
-  insertAction a b c d         = lift $ insertAction a b c d
-  fetchUndeliveredActionEvents = lift fetchUndeliveredActionEvents
-  setActionStatus a b          = lift $ setActionStatus a b
-  fetchActionResponse          = lift . fetchActionResponse
+instance (MonadMetadataStorage m) => MonadMetadataStorage (ExceptT QErr m) where
+  fetchMetadata                        = lift fetchMetadata
+  setMetadata r                        = lift . setMetadata r
+  notifySchemaCacheSync a b            = lift $ notifySchemaCacheSync a b
+  processSchemaSyncEventPayload a b    = lift $ processSchemaSyncEventPayload a b
+  getCatalogState                      = lift getCatalogState
+  setCatalogState a b                  = lift $ setCatalogState a b
+
+  getDatabaseUid                       = lift getDatabaseUid
+  checkMetadataStorageHealth           = lift checkMetadataStorageHealth
+
+  getDeprivedCronTriggerStats          = lift getDeprivedCronTriggerStats
+  getScheduledEventsForDelivery        = lift getScheduledEventsForDelivery
+  insertScheduledEvent                 = lift . insertScheduledEvent
+  insertScheduledEventInvocation a b   = lift $ insertScheduledEventInvocation a b
+  setScheduledEventOp a b c            = lift $ setScheduledEventOp a b c
+  unlockScheduledEvents a b            = lift $ unlockScheduledEvents a b
+  unlockAllLockedScheduledEvents       = lift $ unlockAllLockedScheduledEvents
+  clearFutureCronEvents                = lift . clearFutureCronEvents
+  getOneOffScheduledEvents a b         = lift $ getOneOffScheduledEvents a b
+  getCronEvents a b c                  = lift $ getCronEvents a b c
+  getInvocations a b                   = lift $ getInvocations a b
+  deleteScheduledEvent a b             = lift $ deleteScheduledEvent a b
+
+
+  insertAction a b c d                 = lift $ insertAction a b c d
+  fetchUndeliveredActionEvents         = lift fetchUndeliveredActionEvents
+  setActionStatus a b                  = lift $ setActionStatus a b
+  fetchActionResponse                  = lift . fetchActionResponse
+  clearActionData                      = lift . clearActionData
 
 instance (MonadMetadataStorage m) => MonadMetadataStorage (MetadataT m) where
-  fetchMetadata                     = lift fetchMetadata
-  setMetadata                       = lift . setMetadata
-  notifySchemaCacheSync a b         = lift $ notifySchemaCacheSync a b
-  processSchemaSyncEventPayload a b = lift $ processSchemaSyncEventPayload a b
+  fetchMetadata                        = lift fetchMetadata
+  setMetadata r                        = lift . setMetadata r
+  notifySchemaCacheSync a b            = lift $ notifySchemaCacheSync a b
+  processSchemaSyncEventPayload a b    = lift $ processSchemaSyncEventPayload a b
+  getCatalogState                      = lift getCatalogState
+  setCatalogState a b                  = lift $ setCatalogState a b
 
-  getDeprivedCronTriggerStats        = lift getDeprivedCronTriggerStats
-  getScheduledEventsForDelivery      = lift getScheduledEventsForDelivery
-  insertScheduledEvent               = lift . insertScheduledEvent
-  insertScheduledEventInvocation a b = lift $ insertScheduledEventInvocation a b
-  setScheduledEventOp a b c          = lift $ setScheduledEventOp a b c
-  unlockScheduledEvents a b          = lift $ unlockScheduledEvents a b
-  unlockAllLockedScheduledEvents     = lift unlockAllLockedScheduledEvents
-  clearFutureCronEvents              = lift . clearFutureCronEvents
+  getDatabaseUid                       = lift getDatabaseUid
+  checkMetadataStorageHealth           = lift checkMetadataStorageHealth
 
-  insertAction a b c d         = lift $ insertAction a b c d
-  fetchUndeliveredActionEvents = lift fetchUndeliveredActionEvents
-  setActionStatus a b          = lift $ setActionStatus a b
-  fetchActionResponse          = lift . fetchActionResponse
+  getDeprivedCronTriggerStats          = lift getDeprivedCronTriggerStats
+  getScheduledEventsForDelivery        = lift getScheduledEventsForDelivery
+  insertScheduledEvent                 = lift . insertScheduledEvent
+  insertScheduledEventInvocation a b   = lift $ insertScheduledEventInvocation a b
+  setScheduledEventOp a b c            = lift $ setScheduledEventOp a b c
+  unlockScheduledEvents a b            = lift $ unlockScheduledEvents a b
+  unlockAllLockedScheduledEvents       = lift $ unlockAllLockedScheduledEvents
+  clearFutureCronEvents                = lift . clearFutureCronEvents
+  getOneOffScheduledEvents a b         = lift $ getOneOffScheduledEvents a b
+  getCronEvents a b c                  = lift $ getCronEvents a b c
+  getInvocations a b                   = lift $ getInvocations a b
+  deleteScheduledEvent a b             = lift $ deleteScheduledEvent a b
+
+
+  insertAction a b c d                 = lift $ insertAction a b c d
+  fetchUndeliveredActionEvents         = lift fetchUndeliveredActionEvents
+  setActionStatus a b                  = lift $ setActionStatus a b
+  fetchActionResponse                  = lift . fetchActionResponse
+  clearActionData                      = lift . clearActionData
 
 {- Note [Generic MetadataStorageT transformer]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -266,6 +336,7 @@ newtype MetadataStorageT m a
            , MFunctor
            , Tracing.HasReporter
            , Tracing.MonadTrace
+           , MonadResolveSource
            )
 
 deriving instance (MonadBase IO m) => MonadBase IO (MetadataStorageT m)
@@ -280,9 +351,14 @@ instance (Monad m, Monad (t m), MonadTrans t, MonadMetadataStorage (MetadataStor
   => MonadMetadataStorage (MetadataStorageT (t m)) where
 
   fetchMetadata                     = hoist lift fetchMetadata
-  setMetadata                       = hoist lift . setMetadata
+  setMetadata r                     = hoist lift . setMetadata r
   notifySchemaCacheSync a b         = hoist lift $ notifySchemaCacheSync a b
   processSchemaSyncEventPayload a b = hoist lift $ processSchemaSyncEventPayload a b
+  getCatalogState                   = hoist lift getCatalogState
+  setCatalogState a b               = hoist lift $ setCatalogState a b
+
+  getDatabaseUid = hoist lift getDatabaseUid
+  checkMetadataStorageHealth = hoist lift checkMetadataStorageHealth
 
   getDeprivedCronTriggerStats        = hoist lift getDeprivedCronTriggerStats
   getScheduledEventsForDelivery      = hoist lift getScheduledEventsForDelivery
@@ -290,15 +366,21 @@ instance (Monad m, Monad (t m), MonadTrans t, MonadMetadataStorage (MetadataStor
   insertScheduledEventInvocation a b = hoist lift $ insertScheduledEventInvocation a b
   setScheduledEventOp a b c          = hoist lift $ setScheduledEventOp a b c
   unlockScheduledEvents a b          = hoist lift $ unlockScheduledEvents a b
-  unlockAllLockedScheduledEvents     = hoist lift unlockAllLockedScheduledEvents
+  unlockAllLockedScheduledEvents     = hoist lift $ unlockAllLockedScheduledEvents
   clearFutureCronEvents              = hoist lift . clearFutureCronEvents
+  getOneOffScheduledEvents a b       = hoist lift $ getOneOffScheduledEvents a b
+  getCronEvents a b c                = hoist lift $ getCronEvents a b c
+  getInvocations a b                 = hoist lift $ getInvocations a b
+  deleteScheduledEvent a b           = hoist lift $ deleteScheduledEvent a b
 
-  insertAction a b c d         = hoist lift $ insertAction a b c d
-  fetchUndeliveredActionEvents = hoist lift fetchUndeliveredActionEvents
-  setActionStatus a b          = hoist lift $ setActionStatus a b
-  fetchActionResponse          = hoist lift . fetchActionResponse
+  insertAction a b c d               = hoist lift $ insertAction a b c d
+  fetchUndeliveredActionEvents       = hoist lift fetchUndeliveredActionEvents
+  setActionStatus a b                = hoist lift $ setActionStatus a b
+  fetchActionResponse                = hoist lift . fetchActionResponse
+  clearActionData                    = hoist lift . clearActionData
 
-class (MonadMetadataStorage m) => MonadScheduledEvents m where
+-- | Operations from @'MonadMetadataStorage' used in '/v1/query' and '/v1/metadata' APIs
+class (MonadMetadataStorage m) => MonadMetadataStorageQueryAPI m where
   -- | Record a cron/one-off event
   createScheduledEvent :: ScheduledEventSeed -> m ()
   createScheduledEvent = insertScheduledEvent
@@ -307,7 +389,39 @@ class (MonadMetadataStorage m) => MonadScheduledEvents m where
   dropFutureCronEvents :: TriggerName -> m ()
   dropFutureCronEvents = clearFutureCronEvents
 
-instance (MonadScheduledEvents m) => MonadScheduledEvents (ReaderT r m)
-instance (MonadScheduledEvents m) => MonadScheduledEvents (StateT s m)
-instance (MonadScheduledEvents m) => MonadScheduledEvents (Tracing.TraceT m)
-instance (MonadScheduledEvents m) => MonadScheduledEvents (MetadataT m)
+  -- | Delete async action logs
+  deleteActionData :: ActionName -> m ()
+  deleteActionData = clearActionData
+
+  -- | Fetch cron/oneoff scheduled event invocations
+  fetchInvocations
+    :: GetInvocationsBy
+    -> ScheduledEventPagination
+    -> m (WithTotalCount [ScheduledEventInvocation])
+  fetchInvocations = getInvocations
+
+  -- | Fetch cron/oneoff scheduled events
+  fetchScheduledEvents :: GetScheduledEvents -> m Value
+  fetchScheduledEvents GetScheduledEvents{..} = do
+    let totalCountToJSON WithTotalCount{..} =
+          object ["count" .= _wtcCount, "events" .= _wtcData]
+    case _gseScheduledEvent of
+      SEOneOff    -> totalCountToJSON <$> getOneOffScheduledEvents _gsePagination _gseStatus
+      SECron name -> totalCountToJSON <$> getCronEvents name _gsePagination _gseStatus
+
+  -- | Drop a cron/oneoff scheduled event
+  dropEvent :: ScheduledEventId -> ScheduledEventType -> m ()
+  dropEvent = deleteScheduledEvent
+
+  -- | Retrieve the state from metadata storage catalog
+  fetchCatalogState :: m CatalogState
+  fetchCatalogState = getCatalogState
+
+  -- | Update the state from metadata storage catalog
+  updateCatalogState :: CatalogStateType -> Value -> m ()
+  updateCatalogState = setCatalogState
+
+instance (MonadMetadataStorageQueryAPI m) => MonadMetadataStorageQueryAPI (ReaderT r m)
+instance (MonadMetadataStorageQueryAPI m) => MonadMetadataStorageQueryAPI (StateT s m)
+instance (MonadMetadataStorageQueryAPI m) => MonadMetadataStorageQueryAPI (Tracing.TraceT m)
+instance (MonadMetadataStorageQueryAPI m) => MonadMetadataStorageQueryAPI (MetadataT m)

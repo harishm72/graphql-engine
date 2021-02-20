@@ -21,29 +21,27 @@ module Hasura.RQL.DDL.Action
 
 import           Hasura.Prelude
 
-import qualified Data.Aeson                         as J
-import qualified Data.Aeson.Casing                  as J
-import qualified Data.Aeson.TH                      as J
-import qualified Data.Environment                   as Env
-import qualified Data.HashMap.Strict                as Map
-import qualified Data.HashMap.Strict.InsOrd         as OMap
-import qualified Database.PG.Query                  as Q
-import qualified Language.GraphQL.Draft.Syntax      as G
+import qualified Data.Aeson                    as J
+import qualified Data.Aeson.TH                 as J
+import qualified Data.Dependent.Map            as DMap
+import qualified Data.Environment              as Env
+import qualified Data.HashMap.Strict           as Map
+import qualified Data.HashMap.Strict.InsOrd    as OMap
+import qualified Language.GraphQL.Draft.Syntax as G
 
-import           Control.Lens                       ((.~))
+import           Control.Lens                  ((.~))
 import           Data.Text.Extended
 
-import           Hasura.Backends.Postgres.SQL.Types
 import           Hasura.EncJSON
-import           Hasura.GraphQL.Utils
-import           Hasura.RQL.DDL.CustomTypes         (lookupPGScalar)
+import           Hasura.Metadata.Class
+import           Hasura.RQL.DDL.CustomTypes    (lookupPGScalar)
 import           Hasura.RQL.Types
 import           Hasura.Session
 
 
 getActionInfo
   :: (QErrM m, CacheRM m)
-  => ActionName -> m (ActionInfo 'Postgres)
+  => ActionName -> m ActionInfo
 getActionInfo actionName = do
   actionMap <- scActions <$> askSchemaCache
   onNothing (Map.lookup actionName actionMap) $
@@ -88,32 +86,32 @@ referred scalars.
 resolveAction
   :: QErrM m
   => Env.Environment
-  -> AnnotatedCustomTypes 'Postgres
+  -> AnnotatedCustomTypes
   -> ActionDefinitionInput
-  -> HashSet PGScalarType -- See Note [Postgres scalars in custom types]
+  -> DMap.DMap BackendTag ScalarSet -- See Note [Postgres scalars in custom types]
   -> m ( ResolvedActionDefinition
-       , AnnotatedObjectType 'Postgres
+       , AnnotatedObjectType
        )
-resolveAction env AnnotatedCustomTypes{..} ActionDefinition{..} allPGScalars = do
+resolveAction env AnnotatedCustomTypes{..} ActionDefinition{..} allScalars = do
   resolvedArguments <- forM _adArguments $ \argumentDefinition -> do
     forM argumentDefinition $ \argumentType -> do
       let gType = unGraphQLType argumentType
           argumentBaseType = G.getBaseType gType
       (gType,) <$>
-        if | Just pgScalar <- lookupPGScalar allPGScalars argumentBaseType ->
-               pure $ NOCTScalar $ ASTReusedScalar argumentBaseType pgScalar
+        if | Just noCTScalar <- lookupPGScalar allScalars argumentBaseType (NOCTScalar . ASTReusedScalar argumentBaseType) ->
+               pure noCTScalar
            | Just nonObjectType <- Map.lookup argumentBaseType _actNonObjects ->
                pure nonObjectType
            | otherwise ->
                throw400 InvalidParams $
-               "the type: " <> showName argumentBaseType
+               "the type: " <> dquote argumentBaseType
                <> " is not defined in custom types or it is not a scalar/enum/input_object"
 
   -- Check if the response type is an object
   let outputType = unGraphQLType _adOutputType
       outputBaseType = G.getBaseType outputType
   outputObject <- onNothing (Map.lookup outputBaseType _actObjects) $
-    throw400 NotExists $ "the type: " <> showName outputBaseType
+    throw400 NotExists $ "the type: " <> dquote outputBaseType
     <> " is not an object type defined in custom types"
   resolvedWebhook <- resolveWebhook env _adHandler
   pure ( ActionDefinition resolvedArguments _adOutputType _adType
@@ -149,18 +147,20 @@ data DropAction
   { _daName      :: !ActionName
   , _daClearData :: !(Maybe ClearActionData)
   } deriving (Show, Eq)
-$(J.deriveJSON (J.aesonDrop 3 J.snakeCase) ''DropAction)
+$(J.deriveJSON hasuraJSON ''DropAction)
 
 runDropAction
-  :: (QErrM m, CacheRWM m, MonadTx m, MetadataM m)
+  :: ( CacheRWM m
+     , MetadataM m
+     , MonadMetadataStorageQueryAPI m
+     )
   => DropAction -> m EncJSON
 runDropAction (DropAction actionName clearDataM)= do
   void $ getActionInfo actionName
   withNewInconsistentObjsCheck
     $ buildSchemaCache
     $ dropActionInMetadata actionName
-  when (shouldClearActionData clearData) $
-    liftTx $ clearActionDataFromCatalog actionName
+  when (shouldClearActionData clearData) $ deleteActionData actionName
   return successMsg
   where
     -- When clearData is not present we assume that
@@ -170,13 +170,6 @@ runDropAction (DropAction actionName clearDataM)= do
 dropActionInMetadata :: ActionName -> MetadataModifier
 dropActionInMetadata name =
   MetadataModifier $ metaActions %~ OMap.delete name
-
-clearActionDataFromCatalog :: ActionName -> Q.TxE QErr ()
-clearActionDataFromCatalog actionName =
-  Q.unitQE defaultTxErrorHandler [Q.sql|
-      DELETE FROM hdb_catalog.hdb_action_log
-        WHERE action_name = $1
-      |] (Identity actionName) True
 
 newtype ActionMetadataField
   = ActionMetadataField { unActionMetadataField :: Text }
@@ -203,7 +196,7 @@ data DropActionPermission
   { _dapAction :: !ActionName
   , _dapRole   :: !RoleName
   } deriving (Show, Eq)
-$(J.deriveJSON (J.aesonDrop 4 J.snakeCase) ''DropActionPermission)
+$(J.deriveJSON hasuraJSON ''DropActionPermission)
 
 runDropActionPermission
   :: (QErrM m, CacheRWM m, MetadataM m)

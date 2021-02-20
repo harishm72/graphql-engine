@@ -12,7 +12,7 @@ import qualified Data.Sequence                      as Seq
 import qualified Language.GraphQL.Draft.Syntax      as G
 
 import           Control.Arrow.Extended
-import           Control.Lens                       ((^.), _3)
+import           Control.Lens                       (_3, _4, (^.))
 import           Data.Aeson
 import           Data.Text.Extended
 
@@ -20,21 +20,22 @@ import qualified Hasura.Incremental                 as Inc
 
 import           Hasura.RQL.DDL.ComputedField
 import           Hasura.RQL.DDL.Relationship
-import           Hasura.RQL.DDL.RemoteRelationship
 import           Hasura.RQL.DDL.Schema.Cache.Common
 import           Hasura.RQL.DDL.Schema.Function
 import           Hasura.RQL.Types
 
 addNonColumnFields
   :: ( ArrowChoice arr, Inc.ArrowDistribute arr, ArrowWriter (Seq CollectedInfo) arr
-     , ArrowKleisli m arr, MonadError QErr m )
-  => ( HashMap (TableName 'Postgres) (TableCoreInfoG 'Postgres (ColumnInfo 'Postgres) (ColumnInfo 'Postgres))
-     , FieldInfoMap (ColumnInfo 'Postgres)
+     , ArrowKleisli m arr, MonadError QErr m, BackendMetadata b)
+  => ( SourceName
+     , HashMap (TableName b) (TableCoreInfoG b (ColumnInfo b) (ColumnInfo b))
+     , FieldInfoMap (ColumnInfo b)
      , RemoteSchemaMap
-     , PostgresFunctionsMetadata
-     , NonColumnTableInputs
-     ) `arr` FieldInfoMap (FieldInfo 'Postgres)
-addNonColumnFields = proc ( rawTableInfo
+     , DBFunctionsMetadata b
+     , NonColumnTableInputs b
+     ) `arr` FieldInfoMap (FieldInfo b)
+addNonColumnFields = proc ( source
+                          , rawTableInfo
                           , columns
                           , remoteSchemaMap
                           , pgFunctions
@@ -42,33 +43,33 @@ addNonColumnFields = proc ( rawTableInfo
                           ) -> do
   objectRelationshipInfos
     <- buildInfoMapPreservingMetadata
-         (_rdName . snd)
+         (_rdName . (^. _3))
          (mkRelationshipMetadataObject ObjRel)
          buildObjectRelationship
-    -< (_tciForeignKeys <$> rawTableInfo, map (_nctiTable,) _nctiObjectRelationships)
+    -< (_tciForeignKeys <$> rawTableInfo, map (source, _nctiTable,) _nctiObjectRelationships)
 
   arrayRelationshipInfos
     <- buildInfoMapPreservingMetadata
-         (_rdName . snd)
+         (_rdName . (^. _3))
          (mkRelationshipMetadataObject ArrRel)
          buildArrayRelationship
-    -< (_tciForeignKeys <$> rawTableInfo, map (_nctiTable,) _nctiArrayRelationships)
+    -< (_tciForeignKeys <$> rawTableInfo, map (source, _nctiTable,) _nctiArrayRelationships)
 
   let relationshipInfos = objectRelationshipInfos <> arrayRelationshipInfos
 
   computedFieldInfos
     <- buildInfoMapPreservingMetadata
-         (_cfmName . (^. _3))
-         (\(_, t, c) -> mkComputedFieldMetadataObject t c)
+         (_cfmName . (^. _4))
+         (\(s, _, t, c) -> mkComputedFieldMetadataObject (s, t, c))
          buildComputedField
-    -< (HS.fromList $ M.keys rawTableInfo, map (pgFunctions, _nctiTable,) _nctiComputedFields)
+    -< (HS.fromList $ M.keys rawTableInfo, map (source, pgFunctions, _nctiTable,) _nctiComputedFields)
 
   rawRemoteRelationshipInfos
     <- buildInfoMapPreservingMetadata
-         (_rrmName . snd)
+         (_rrmName . (^. _3))
          mkRemoteRelationshipMetadataObject
          buildRemoteRelationship
-    -< ((M.elems columns, remoteSchemaMap), map (_nctiTable,) _nctiRemoteRelationships)
+    -< ((M.elems columns, remoteSchemaMap), map (source, _nctiTable,) _nctiRemoteRelationships)
 
   let relationshipFields = mapKeys fromRel relationshipInfos
       computedFieldFields = mapKeys fromComputedField computedFieldInfos
@@ -84,7 +85,7 @@ addNonColumnFields = proc ( rawTableInfo
     -- Next, check for conflicts with custom field names. This is easiest to do before merging with
     -- the column info itself because we have access to the information separately, and custom field
     -- names are not currently stored as a separate map (but maybe should be!).
-    >-> (\fields -> (columns, M.catMaybes fields) >- noCustomFieldConflicts)
+    >-> (\fields -> (columns, M.catMaybes fields) >- (noCustomFieldConflicts))
     -- Finally, check for conflicts with the columns themselves.
     >-> (\fields -> align columns (M.catMaybes fields) >- returnA)
     >-> (| Inc.keyed (\_ fields -> fields >- noColumnConflicts) |)
@@ -124,54 +125,61 @@ addNonColumnFields = proc ( rawTableInfo
         returnA -< FIColumn columnInfo
 
 mkRelationshipMetadataObject
-  :: (ToJSON a)
-  => RelType -> (TableName 'Postgres, RelDef a) -> MetadataObject
-mkRelationshipMetadataObject relType (table, relDef) =
-  let objectId = MOTableObj table $ MTORel (_rdName relDef) relType
-  in MetadataObject objectId $ toJSON $ WithTable table relDef
+  :: (ToJSON a, Backend b)
+  => RelType -> (SourceName, TableName b, RelDef a) -> MetadataObject
+mkRelationshipMetadataObject relType (source, table, relDef) =
+  let objectId = MOSourceObjId source $
+                 SMOTableObj table $ MTORel (_rdName relDef) relType
+  in MetadataObject objectId $ toJSON $ WithTable source table relDef
 
 buildObjectRelationship
   :: ( ArrowChoice arr
      , ArrowWriter (Seq CollectedInfo) arr
+     , Backend b
      )
-  => ( HashMap (TableName 'Postgres) (HashSet (ForeignKey 'Postgres))
-     , ( TableName 'Postgres
-       , ObjRelDef
+  => ( HashMap (TableName b) (HashSet (ForeignKey b))
+     , ( SourceName
+       , TableName b
+       , ObjRelDef b
        )
-     ) `arr` Maybe (RelInfo 'Postgres)
-buildObjectRelationship = proc (fkeysMap, (table, relDef)) -> do
+     ) `arr` Maybe (RelInfo b)
+buildObjectRelationship = proc (fkeysMap, (source, table, relDef)) -> do
   let buildRelInfo def = do
-        fkeys <- getTableInfo table fkeysMap
-        objRelP2Setup table fkeys def
-  buildRelationship -< (table, buildRelInfo, ObjRel, relDef)
+        fkeys <- findTable table fkeysMap
+        objRelP2Setup source table fkeys def
+  buildRelationship -< (source, table, buildRelInfo, ObjRel, relDef)
 
 buildArrayRelationship
   :: ( ArrowChoice arr
      , ArrowWriter (Seq CollectedInfo) arr
+     , Backend b
      )
-  => ( HashMap (TableName 'Postgres) (HashSet (ForeignKey 'Postgres))
-     , ( TableName 'Postgres
-       , ArrRelDef
+  => ( HashMap (TableName b) (HashSet (ForeignKey b))
+     , ( SourceName
+       , TableName b
+       , ArrRelDef b
        )
-     ) `arr` Maybe (RelInfo 'Postgres)
-buildArrayRelationship = proc (fkeysMap, (table, relDef)) -> do
-  let buildRelInfo def = arrRelP2Setup fkeysMap table def
-  buildRelationship -< (table, buildRelInfo, ArrRel, relDef)
+     ) `arr` Maybe (RelInfo b)
+buildArrayRelationship = proc (fkeysMap, (source, table, relDef)) -> do
+  let buildRelInfo def = arrRelP2Setup fkeysMap source table def
+  buildRelationship -< (source, table, buildRelInfo, ArrRel, relDef)
 
 buildRelationship
   :: ( ArrowChoice arr
      , ArrowWriter (Seq CollectedInfo) arr
      , ToJSON a
+     , Backend b
      )
-  => ( TableName 'Postgres
-     , (RelDef a -> Either QErr (RelInfo 'Postgres, [SchemaDependency]))
+  => ( SourceName
+     , TableName b
+     , (RelDef a -> Either QErr (RelInfo b, [SchemaDependency]))
      , RelType
      , RelDef a
-     ) `arr` Maybe (RelInfo 'Postgres)
-buildRelationship = proc (table, buildRelInfo, relType, relDef) -> do
+     ) `arr` Maybe (RelInfo b)
+buildRelationship = proc (source, table, buildRelInfo, relType, relDef) -> do
   let relName = _rdName relDef
-      metadataObject = mkRelationshipMetadataObject relType (table, relDef)
-      schemaObject = SOTableObj table $ TORel relName
+      metadataObject = mkRelationshipMetadataObject relType (source, table, relDef)
+      schemaObject = SOSourceObj source $ SOITableObj table $ TORel relName
       addRelationshipContext e = "in relationship " <> relName <<> ": " <> e
   (| withRecordInconsistency (
      (| modifyErrA (do
@@ -182,55 +190,58 @@ buildRelationship = proc (table, buildRelInfo, relType, relDef) -> do
    |) metadataObject
 
 mkComputedFieldMetadataObject
-  :: TableName 'Postgres -> ComputedFieldMetadata -> MetadataObject
-mkComputedFieldMetadataObject table ComputedFieldMetadata{..} =
-  let objectId = MOTableObj table $ MTOComputedField _cfmName
-      definition = AddComputedField table _cfmName _cfmDefinition _cfmComment
+  :: (Backend b) => (SourceName, TableName b, ComputedFieldMetadata b) -> MetadataObject
+mkComputedFieldMetadataObject (source, table, ComputedFieldMetadata{..}) =
+  let objectId = MOSourceObjId source $ SMOTableObj table $ MTOComputedField _cfmName
+      definition = AddComputedField source table _cfmName _cfmDefinition _cfmComment
   in MetadataObject objectId (toJSON definition)
 
 buildComputedField
   :: ( ArrowChoice arr, ArrowWriter (Seq CollectedInfo) arr
-     , ArrowKleisli m arr, MonadError QErr m )
-  => ( HashSet (TableName 'Postgres)
-     , (PostgresFunctionsMetadata, TableName 'Postgres, ComputedFieldMetadata)
-     ) `arr` Maybe (ComputedFieldInfo 'Postgres)
-buildComputedField = proc (trackedTableNames, (pgFunctions, table, cf@ComputedFieldMetadata{..})) -> do
+     , ArrowKleisli m arr, MonadError QErr m, BackendMetadata b )
+  => ( HashSet (TableName b)
+     , (SourceName, DBFunctionsMetadata b, TableName b, ComputedFieldMetadata b)
+     ) `arr` Maybe (ComputedFieldInfo b)
+buildComputedField = proc (trackedTableNames, (source, pgFunctions, table, cf@ComputedFieldMetadata{..})) -> do
   let addComputedFieldContext e = "in computed field " <> _cfmName <<> ": " <> e
       function = _cfdFunction _cfmDefinition
       funcDefs = fromMaybe [] $ M.lookup function pgFunctions
   (| withRecordInconsistency (
      (| modifyErrA (do
           rawfi <- bindErrorA -< handleMultipleFunctions (_cfdFunction _cfmDefinition) funcDefs
-          bindErrorA -< addComputedFieldP2Setup trackedTableNames table _cfmName _cfmDefinition rawfi _cfmComment)
+          bindErrorA -< buildComputedFieldInfo trackedTableNames table _cfmName _cfmDefinition rawfi _cfmComment)
      |) (addTableContext table . addComputedFieldContext))
-   |) (mkComputedFieldMetadataObject table cf)
+   |) (mkComputedFieldMetadataObject (source, table, cf))
 
 mkRemoteRelationshipMetadataObject
-  :: (TableName 'Postgres, RemoteRelationshipMetadata) -> MetadataObject
-mkRemoteRelationshipMetadataObject (table, RemoteRelationshipMetadata{..}) =
-  let objectId = MOTableObj table $ MTORemoteRelationship _rrmName
+  :: (Backend b)
+  => (SourceName, TableName b, RemoteRelationshipMetadata) -> MetadataObject
+mkRemoteRelationshipMetadataObject (source, table, RemoteRelationshipMetadata{..}) =
+  let objectId = MOSourceObjId source $
+                 SMOTableObj table $ MTORemoteRelationship _rrmName
       RemoteRelationshipDef{..} = _rrmDefinition
   in MetadataObject objectId $ toJSON $
-     RemoteRelationship _rrmName table _rrdHasuraFields _rrdRemoteSchema _rrdRemoteField
+     RemoteRelationship _rrmName source table _rrdHasuraFields _rrdRemoteSchema _rrdRemoteField
 
 buildRemoteRelationship
   :: ( ArrowChoice arr, ArrowWriter (Seq CollectedInfo) arr
-     , ArrowKleisli m arr, MonadError QErr m )
-  => ( ([ColumnInfo 'Postgres], RemoteSchemaMap)
-     , (TableName 'Postgres, RemoteRelationshipMetadata)
-     ) `arr` Maybe (RemoteFieldInfo 'Postgres)
+     , ArrowKleisli m arr, MonadError QErr m, BackendMetadata b)
+  => ( ([ColumnInfo b], RemoteSchemaMap)
+     , (SourceName, TableName b, RemoteRelationshipMetadata)
+     ) `arr` Maybe (RemoteFieldInfo b)
 buildRemoteRelationship = proc ( (pgColumns, remoteSchemaMap)
-                               , (table, rrm@RemoteRelationshipMetadata{..})
+                               , (source, table, rrm@RemoteRelationshipMetadata{..})
                                ) -> do
-  let metadataObject = mkRemoteRelationshipMetadataObject (table, rrm)
-      schemaObj = SOTableObj table $ TORemoteRel _rrmName
+  let metadataObject = mkRemoteRelationshipMetadataObject (source, table, rrm)
+      schemaObj = SOSourceObj source $
+                  SOITableObj table $ TORemoteRel _rrmName
       addRemoteRelationshipContext e = "in remote relationship" <> _rrmName <<> ": " <> e
       RemoteRelationshipDef{..} = _rrmDefinition
-      remoteRelationship = RemoteRelationship _rrmName table _rrdHasuraFields
+      remoteRelationship = RemoteRelationship _rrmName source table _rrdHasuraFields
                            _rrdRemoteSchema _rrdRemoteField
   (| withRecordInconsistency (
        (| modifyErrA (do
-          (remoteField, dependencies) <- bindErrorA -< resolveRemoteRelationship remoteRelationship pgColumns remoteSchemaMap
+          (remoteField, dependencies) <- bindErrorA -< buildRemoteFieldInfo remoteRelationship pgColumns remoteSchemaMap
           recordDependencies -< (metadataObject, schemaObj, dependencies)
           returnA -< remoteField)
         |)(addTableContext table . addRemoteRelationshipContext))

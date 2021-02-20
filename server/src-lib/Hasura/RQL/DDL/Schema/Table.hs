@@ -1,5 +1,5 @@
-{-# LANGUAGE Arrows #-}
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE Arrows              #-}
 
 -- | Description: Create/delete SQL tables to/from Hasura metadata.
 module Hasura.RQL.DDL.Schema.Table
@@ -23,7 +23,7 @@ module Hasura.RQL.DDL.Schema.Table
   , runSetTableCustomization
 
   , buildTableCache
-  , processTableChanges
+  , checkConflictingNode
   ) where
 
 import           Hasura.Prelude
@@ -35,30 +35,30 @@ import qualified Language.GraphQL.Draft.Syntax      as G
 
 import           Control.Arrow.Extended
 import           Control.Lens.Extended              hiding ((.=))
+import           Control.Monad.Trans.Control        (MonadBaseControl)
 import           Data.Aeson
-import           Data.Aeson.Casing
 import           Data.Aeson.TH
 import           Data.Text.Extended
+import           Data.Typeable                      (cast)
 
 import qualified Hasura.Incremental                 as Inc
 
-import           Hasura.Backends.Postgres.SQL.Types (QualifiedTable, snakeCaseQualifiedObject, FunctionName(..))
+import           Hasura.Backends.Postgres.SQL.Types (FunctionName (..), QualifiedTable)
 import           Hasura.EncJSON
 import           Hasura.GraphQL.Context
 import           Hasura.GraphQL.Schema.Common       (textToName)
 import           Hasura.RQL.DDL.Deps
 import           Hasura.RQL.DDL.Schema.Cache.Common
 import           Hasura.RQL.DDL.Schema.Common
-import           Hasura.RQL.DDL.Schema.Diff
-import           Hasura.RQL.DDL.Schema.Enum
-import           Hasura.RQL.DDL.Schema.Rename
+import           Hasura.RQL.DDL.Schema.Enum         (resolveEnumReferences)
 import           Hasura.RQL.Types                   hiding (fmFunction)
 import           Hasura.Server.Utils
 
 
 data TrackTable
   = TrackTable
-  { tName   :: !QualifiedTable
+  { tSource :: !SourceName
+  , tName   :: !QualifiedTable
   , tIsEnum :: !Bool
   } deriving (Show, Eq)
 
@@ -66,50 +66,74 @@ instance FromJSON TrackTable where
   parseJSON v = withOptions <|> withoutOptions
     where
       withOptions = flip (withObject "TrackTable") v $ \o -> TrackTable
-        <$> o .: "table"
+        <$> o .:? "source" .!= defaultSource
+        <*> o .: "table"
         <*> o .:? "is_enum" .!= False
-      withoutOptions = TrackTable <$> parseJSON v <*> pure False
+      withoutOptions = TrackTable defaultSource <$> parseJSON v <*> pure False
 
 instance ToJSON TrackTable where
-  toJSON (TrackTable name isEnum)
-    | isEnum = object [ "table" .= name, "is_enum" .= isEnum ]
+  toJSON (TrackTable source name isEnum)
+    | isEnum = object [ "source" .= source, "table" .= name, "is_enum" .= isEnum ]
     | otherwise = toJSON name
 
 data SetTableIsEnum
   = SetTableIsEnum
-  { stieTable  :: !QualifiedTable
+  { stieSource :: !SourceName
+  , stieTable  :: !QualifiedTable
   , stieIsEnum :: !Bool
   } deriving (Show, Eq)
-$(deriveJSON (aesonDrop 4 snakeCase) ''SetTableIsEnum)
+$(deriveToJSON hasuraJSON ''SetTableIsEnum)
 
-data UntrackTable =
+instance FromJSON SetTableIsEnum where
+  parseJSON = withObject "Object" $ \o ->
+    SetTableIsEnum
+      <$> o .:? "source" .!= defaultSource
+      <*> o .: "table"
+      <*> o .: "is_enum"
+
+data UntrackTable b =
   UntrackTable
-  { utTable   :: !QualifiedTable
-  , utCascade :: !(Maybe Bool)
-  } deriving (Show, Eq)
-$(deriveJSON (aesonDrop 2 snakeCase){omitNothingFields=True} ''UntrackTable)
+  { utSource  :: !SourceName
+  , utTable   :: !(TableName b)
+  , utCascade :: !Bool
+  } deriving (Generic)
+deriving instance (Backend b) => Show (UntrackTable b)
+deriving instance (Backend b) => Eq (UntrackTable b)
+instance (Backend b) => ToJSON (UntrackTable b) where
+  toJSON = genericToJSON hasuraJSON{omitNothingFields=True}
+
+instance (Backend b) => FromJSON (UntrackTable b) where
+  parseJSON = withObject "Object" $ \o ->
+    UntrackTable
+      <$> o .:? "source" .!= defaultSource
+      <*> o .: "table"
+      <*> o .:? "cascade" .!= False
+
+isTableTracked :: SchemaCache -> SourceName -> QualifiedTable -> Bool
+isTableTracked sc source tableName =
+  isJust $ unsafeTableInfo @'Postgres source tableName $ scPostgres sc
 
 -- | Track table/view, Phase 1:
 -- Validate table tracking operation. Fails if table is already being tracked,
 -- or if a function with the same name is being tracked.
-trackExistingTableOrViewP1 :: (QErrM m, CacheRWM m) => QualifiedTable -> m ()
-trackExistingTableOrViewP1 qt = do
+trackExistingTableOrViewP1 :: (QErrM m, CacheRWM m) => SourceName -> QualifiedTable -> m ()
+trackExistingTableOrViewP1 source qt = do
   rawSchemaCache <- askSchemaCache
-  when (Map.member qt $ scTables rawSchemaCache) $
+  when (isTableTracked rawSchemaCache source qt) $
     throw400 AlreadyTracked $ "view/table already tracked : " <>> qt
   let qf = fmap (FunctionName . toTxt) qt
-  when (Map.member qf $ scFunctions rawSchemaCache) $
+  when (isJust $ unsafeFunctionInfo @'Postgres source qf $ scPostgres rawSchemaCache) $
     throw400 NotSupported $ "function with name " <> qt <<> " already exists"
 
 -- | Check whether a given name would conflict with the current schema by doing
 -- an internal introspection
 checkConflictingNode
-  :: MonadError QErr m
+  :: forall m. MonadError QErr m
   => SchemaCache
   -> Text
   -> m ()
 checkConflictingNode sc tnGQL = do
-  let queryParser = gqlQueryParser $ scUnauthenticatedGQLContext sc
+  let GQLContext queryParser _ = scUnauthenticatedGQLContext sc
       -- {
       --   __schema {
       --     queryType {
@@ -152,9 +176,9 @@ checkConflictingNode sc tnGQL = do
         _ -> pure ()
 
 trackExistingTableOrViewP2
-  :: (MonadTx m, CacheRWM m, MetadataM m)
-  => QualifiedTable -> Bool -> TableConfig -> m EncJSON
-trackExistingTableOrViewP2 tableName isEnum config = do
+  :: (MonadError QErr m, CacheRWM m, MetadataM m, BackendMetadata b)
+  => SourceName -> TableName b -> Bool -> TableConfig b -> m EncJSON
+trackExistingTableOrViewP2 source tableName isEnum config = do
   sc <- askSchemaCache
   {-
   The next line does more than what it says on the tin.  Removing the following
@@ -164,227 +188,189 @@ trackExistingTableOrViewP2 tableName isEnum config = do
   tables, and then clicking "track all" in the console.  Curiously, this high
   memory usage happens even when no substantial GraphQL schema is generated.
   -}
-  checkConflictingNode sc $ snakeCaseQualifiedObject tableName
+  checkConflictingNode sc $ snakeCaseTableName tableName
   let metadata = mkTableMeta tableName isEnum config
-  buildSchemaCacheFor (MOTable tableName)
+  buildSchemaCacheFor (MOSourceObjId source $ SMOTable tableName)
     $ MetadataModifier
-    $ metaTables %~ OMap.insert tableName metadata
+    $ metaSources.ix source.toSourceMetadata.smTables %~ OMap.insert tableName metadata
   pure successMsg
 
 runTrackTableQ
-  :: (MonadTx m, CacheRWM m, MetadataM m) => TrackTable -> m EncJSON
-runTrackTableQ (TrackTable qt isEnum) = do
-  trackExistingTableOrViewP1 qt
-  trackExistingTableOrViewP2 qt isEnum emptyTableConfig
+  :: (MonadError QErr m, CacheRWM m, MetadataM m) => TrackTable -> m EncJSON
+runTrackTableQ (TrackTable source qt isEnum) = do
+  trackExistingTableOrViewP1 source qt
+  trackExistingTableOrViewP2 source qt isEnum emptyTableConfig
 
 data TrackTableV2
   = TrackTableV2
   { ttv2Table         :: !TrackTable
-  , ttv2Configuration :: !TableConfig
+  , ttv2Configuration :: !(TableConfig 'Postgres)
   } deriving (Show, Eq)
-$(deriveJSON (aesonDrop 4 snakeCase) ''TrackTableV2)
+$(deriveToJSON hasuraJSON ''TrackTableV2)
+
+instance FromJSON TrackTableV2 where
+  parseJSON = withObject "Object" $ \o -> do
+    table <- parseJSON $ Object o
+    configuration <- o .:? "configuration" .!= emptyTableConfig
+    pure $ TrackTableV2 table configuration
 
 runTrackTableV2Q
-  :: (MonadTx m, CacheRWM m, MetadataM m) => TrackTableV2 -> m EncJSON
-runTrackTableV2Q (TrackTableV2 (TrackTable qt isEnum) config) = do
-  trackExistingTableOrViewP1 qt
-  trackExistingTableOrViewP2 qt isEnum config
+  :: (MonadError QErr m, CacheRWM m, MetadataM m) => TrackTableV2 -> m EncJSON
+runTrackTableV2Q (TrackTableV2 (TrackTable source qt isEnum) config) = do
+  trackExistingTableOrViewP1 source qt
+  trackExistingTableOrViewP2 source qt isEnum config
 
-runSetExistingTableIsEnumQ :: (MonadTx m, CacheRWM m, MetadataM m) => SetTableIsEnum -> m EncJSON
-runSetExistingTableIsEnumQ (SetTableIsEnum tableName isEnum) = do
-  void $ askTabInfo tableName -- assert that table is tracked
-  buildSchemaCacheFor (MOTable tableName)
+runSetExistingTableIsEnumQ :: (MonadError QErr m, CacheRWM m, MetadataM m) => SetTableIsEnum -> m EncJSON
+runSetExistingTableIsEnumQ (SetTableIsEnum source tableName isEnum) = do
+  void $ askTabInfo source tableName -- assert that table is tracked
+  buildSchemaCacheFor (MOSourceObjId source $ SMOTable tableName)
     $ MetadataModifier
-    $ metaTables.ix tableName.tmIsEnum .~ isEnum
+    $ tableMetadataSetter source tableName.tmIsEnum .~ isEnum
   return successMsg
 
 data SetTableCustomization
   = SetTableCustomization
-  { _stcTable         :: !QualifiedTable
-  , _stcConfiguration :: !TableConfig
+  { _stcSource        :: !SourceName
+  , _stcTable         :: !QualifiedTable
+  , _stcConfiguration :: !(TableConfig 'Postgres)
   } deriving (Show, Eq)
-$(deriveJSON (aesonDrop 4 snakeCase) ''SetTableCustomization)
+$(deriveToJSON hasuraJSON ''SetTableCustomization)
+
+instance FromJSON SetTableCustomization where
+  parseJSON = withObject "Object" $ \o ->
+    SetTableCustomization
+      <$> o .:? "source" .!= defaultSource
+      <*> o .: "table"
+      <*> o .: "configuration"
 
 data SetTableCustomFields
   = SetTableCustomFields
-  { _stcfTable             :: !QualifiedTable
+  { _stcfSource            :: !SourceName
+  , _stcfTable             :: !QualifiedTable
   , _stcfCustomRootFields  :: !TableCustomRootFields
-  , _stcfCustomColumnNames :: !CustomColumnNames
+  , _stcfCustomColumnNames :: !(CustomColumnNames 'Postgres)
   } deriving (Show, Eq)
-$(deriveToJSON (aesonDrop 5 snakeCase) ''SetTableCustomFields)
+$(deriveToJSON hasuraJSON ''SetTableCustomFields)
 
 instance FromJSON SetTableCustomFields where
   parseJSON = withObject "SetTableCustomFields" $ \o ->
     SetTableCustomFields
-    <$> o .: "table"
+    <$> o .:? "source" .!= defaultSource
+    <*> o .: "table"
     <*> o .:? "custom_root_fields" .!= emptyCustomRootFields
     <*> o .:? "custom_column_names" .!= Map.empty
 
 runSetTableCustomFieldsQV2
   :: (QErrM m, CacheRWM m, MetadataM m) => SetTableCustomFields -> m EncJSON
-runSetTableCustomFieldsQV2 (SetTableCustomFields tableName rootFields columnNames) = do
-  void $ askTabInfo tableName -- assert that table is tracked
+runSetTableCustomFieldsQV2 (SetTableCustomFields source tableName rootFields columnNames) = do
+  void $ askTabInfo source tableName -- assert that table is tracked
   let tableConfig = TableConfig rootFields columnNames Nothing
-  buildSchemaCacheFor (MOTable tableName)
+  buildSchemaCacheFor (MOSourceObjId source $ SMOTable tableName)
     $ MetadataModifier
-    $ metaTables.ix tableName.tmConfiguration .~ tableConfig
+    $ tableMetadataSetter source tableName.tmConfiguration .~ tableConfig
   return successMsg
 
 runSetTableCustomization
   :: (QErrM m, CacheRWM m, MetadataM m) => SetTableCustomization -> m EncJSON
-runSetTableCustomization (SetTableCustomization table config) = do
-  void $ askTabInfo table
-  buildSchemaCacheFor (MOTable table)
+runSetTableCustomization (SetTableCustomization source table config) = do
+  void $ askTabInfo source table
+  buildSchemaCacheFor (MOSourceObjId source $ SMOTable table)
     $ MetadataModifier
-    $ metaTables.ix table.tmConfiguration .~ config
+    $ tableMetadataSetter source table.tmConfiguration .~ config
   return successMsg
 
 unTrackExistingTableOrViewP1
-  :: (CacheRM m, QErrM m) => UntrackTable -> m ()
-unTrackExistingTableOrViewP1 (UntrackTable vn _) = do
-  rawSchemaCache <- askSchemaCache
-  case Map.lookup vn (scTables rawSchemaCache) of
-    Just ti ->
-      -- Check if table/view is system defined
-      when (isSystemDefined $ _tciSystemDefined $ _tiCoreInfo ti) $ throw400 NotSupported $
-        vn <<> " is system defined, cannot untrack"
-    Nothing -> throw400 AlreadyUntracked $
-      "view/table already untracked : " <>> vn
+  :: forall m b. (CacheRM m, QErrM m, Backend b) => UntrackTable b -> m ()
+unTrackExistingTableOrViewP1 (UntrackTable source vn _) = do
+  schemaCache <- askSchemaCache
+  tableInfo   <- unsafeTableInfo @b source vn (scPostgres schemaCache)
+    `onNothing` throw400 AlreadyUntracked ("view/table already untracked : " <>> vn)
+  when (isSystemDefined $ _tciSystemDefined $ _tiCoreInfo tableInfo) $
+    throw400 NotSupported $ vn <<> " is system defined, cannot untrack"
 
 unTrackExistingTableOrViewP2
-  :: (CacheRWM m, QErrM m, MetadataM m)
-  => UntrackTable -> m EncJSON
-unTrackExistingTableOrViewP2 (UntrackTable qtn cascade) = withNewInconsistentObjsCheck do
+  :: forall m b
+   . (CacheRWM m, QErrM m, MetadataM m, BackendMetadata b)
+  => UntrackTable b -> m EncJSON
+unTrackExistingTableOrViewP2 (UntrackTable source qtn cascade) = withNewInconsistentObjsCheck do
   sc <- askSchemaCache
 
   -- Get relational, query template and function dependants
-  let allDeps = getDependentObjs sc (SOTable qtn)
-      indirectDeps = filter (not . isDirectDep) allDeps
+  let allDeps = getDependentObjs sc (SOSourceObj source $ SOITable qtn)
+      indirectDeps = mapMaybe getIndirectDep allDeps
   -- Report bach with an error if cascade is not set
-  when (indirectDeps /= [] && not (or cascade)) $ reportDepsExt indirectDeps []
+  when (indirectDeps /= [] && not cascade) $ reportDepsExt (map (SOSourceObj source) indirectDeps) []
   -- Purge all the dependents from state
   metadataModifier <- execWriterT do
-    mapM_ (purgeDependentObject >=> tell) indirectDeps
-    tell $ dropTableInMetadata qtn
+    mapM_ (purgeDependentObject source >=> tell) indirectDeps
+    tell $ dropTableInMetadata source qtn
   -- delete the table and its direct dependencies
   buildSchemaCache metadataModifier
   pure successMsg
   where
-    isDirectDep = \case
-      (SOTableObj dtn _) -> qtn == dtn
-      _                  -> False
+    getIndirectDep :: SchemaObjId -> Maybe (SourceObjId b)
+    getIndirectDep = \case
+      SOSourceObj s srcObjId ->
+        -- If the dependency is to any other source, it automatically is an
+        -- indirect dependency, hence the cast is safe here. However, we don't
+        -- have these cross source dependencies yet
+        cast srcObjId >>= \case
+          v@(SOITableObj dtn _) ->
+            if not (s == source && qtn == dtn) then Just v else Nothing
+          v                 -> Just v
+      _                     -> Nothing
 
-dropTableInMetadata :: QualifiedTable -> MetadataModifier
-dropTableInMetadata table =
-  MetadataModifier $ metaTables %~ OMap.delete table
+dropTableInMetadata :: (BackendMetadata b) => SourceName -> TableName b -> MetadataModifier
+dropTableInMetadata source table =
+  MetadataModifier $ metaSources.ix source.toSourceMetadata.smTables %~ OMap.delete table
 
 runUntrackTableQ
-  :: (CacheRWM m, QErrM m, MetadataM m)
-  => UntrackTable -> m EncJSON
+  :: (CacheRWM m, QErrM m, MetadataM m, BackendMetadata b)
+  => UntrackTable b -> m EncJSON
 runUntrackTableQ q = do
   unTrackExistingTableOrViewP1 q
   unTrackExistingTableOrViewP2 q
-
-processTableChanges
-  :: ( MonadError QErr m
-     , CacheRM m
-     , MonadWriter MetadataModifier m
-     )
-  => TableCoreInfo 'Postgres -> TableDiff 'Postgres -> m ()
-processTableChanges ti tableDiff = do
-  -- If table rename occurs then don't replace constraints and
-  -- process dropped/added columns, because schema reload happens eventually
-  sc <- askSchemaCache
-  let tn = _tciName ti
-      withOldTabName = do
-        procAlteredCols sc tn
-
-      withNewTabName newTN = do
-        let tnGQL = snakeCaseQualifiedObject newTN
-        -- check for GraphQL schema conflicts on new name
-        checkConflictingNode sc tnGQL
-        procAlteredCols sc tn
-        -- update new table in metadata
-        renameTableInMetadata newTN tn
-
-  -- Process computed field diff
-  processComputedFieldDiff tn
-  -- Drop custom column names for dropped columns
-  possiblyDropCustomColumnNames tn
-  maybe withOldTabName withNewTabName mNewName
-  where
-    TableDiff mNewName droppedCols _ alteredCols _ computedFieldDiff _ _ = tableDiff
-
-    possiblyDropCustomColumnNames tn = do
-      let TableConfig customFields customColumnNames customName = _tciCustomConfig ti
-          modifiedCustomColumnNames = foldl' (flip Map.delete) customColumnNames droppedCols
-      when (modifiedCustomColumnNames /= customColumnNames) $
-        tell $ MetadataModifier $
-          metaTables.ix tn.tmConfiguration .~ (TableConfig customFields modifiedCustomColumnNames customName)
-
-    procAlteredCols sc tn = for_ alteredCols $
-      \( RawColumnInfo oldName _ oldType _ _
-       , RawColumnInfo newName _ newType _ _ ) -> do
-        if | oldName /= newName ->
-             renameColumnInMetadata oldName newName tn (_tciFieldInfoMap ti)
-
-           | oldType /= newType -> do
-              let colId = SOTableObj tn $ TOCol oldName
-                  typeDepObjs = getDependentObjsWith (== DROnType) sc colId
-
-              unless (null typeDepObjs) $ throw400 DependencyError $
-                "cannot change type of column " <> oldName <<> " in table "
-                <> tn <<> " because of the following dependencies : " <>
-                reportSchemaObjs typeDepObjs
-
-           | otherwise -> pure ()
-
-    processComputedFieldDiff table  = do
-      let ComputedFieldDiff _ altered overloaded = computedFieldDiff
-          getFunction = fmFunction . ccmFunctionMeta
-      forM_ overloaded $ \(columnName, function) ->
-        throw400 NotSupported $ "The function " <> function
-        <<> " associated with computed field" <> columnName
-        <<> " of table " <> table <<> " is being overloaded"
-      forM_ altered $ \(old, new) ->
-        if | (fmType . ccmFunctionMeta) new == FTVOLATILE ->
-             throw400 NotSupported $ "The type of function " <> getFunction old
-             <<> " associated with computed field " <> ccmName old
-             <<> " of table " <> table <<> " is being altered to \"VOLATILE\""
-           | otherwise -> pure ()
 
 -- | Builds an initial @'TableCache' 'ColumnInfo'@ from catalog information. Does not fill in
 -- '_tiRolePermInfoMap' or '_tiEventTriggerInfoMap' at all, and '_tiFieldInfoMap' only contains
 -- columns, not relationships; those pieces of information are filled in by later stages.
 buildTableCache
-  :: forall arr m
+  :: forall arr m b
    . ( ArrowChoice arr, Inc.ArrowDistribute arr, ArrowWriter (Seq CollectedInfo) arr
-     , Inc.ArrowCache m arr, MonadTx m
+     , Inc.ArrowCache m arr, MonadIO m, MonadBaseControl IO m, BackendMetadata b
      )
-  => ( DBTablesMetadata 'Postgres
-     , [TableBuildInput]
+  => ( SourceName
+     , SourceConfig b
+     , DBTablesMetadata b
+     , [TableBuildInput b]
      , Inc.Dependency Inc.InvalidationKey
-     ) `arr` Map.HashMap (TableName 'Postgres) (TableCoreInfoG 'Postgres (ColumnInfo 'Postgres) (ColumnInfo 'Postgres))
-buildTableCache = Inc.cache proc (pgTables, tableBuildInputs, reloadMetadataInvalidationKey) -> do
+     ) `arr` Map.HashMap (TableName b) (TableCoreInfoG b (ColumnInfo b) (ColumnInfo b))
+buildTableCache = Inc.cache proc (source, pgSourceConfig, pgTables, tableBuildInputs, reloadMetadataInvalidationKey) -> do
   rawTableInfos <-
     (| Inc.keyed (| withTable (\tables -> do
          table <- noDuplicateTables -< tables
          let maybeInfo = Map.lookup (_tbiName table) pgTables
-         buildRawTableInfo -< (table, maybeInfo, reloadMetadataInvalidationKey)
+         buildRawTableInfo -< (table, maybeInfo, pgSourceConfig, reloadMetadataInvalidationKey)
          )
        |)
-    |) (Map.groupOnNE _tbiName tableBuildInputs)
-  let rawTableCache = Map.catMaybes rawTableInfos
+    |) (withSourceInKey source $ Map.groupOnNE _tbiName tableBuildInputs)
+  let rawTableCache = removeSourceInKey $ Map.catMaybes rawTableInfos
       enumTables = flip Map.mapMaybe rawTableCache \rawTableInfo ->
         (,) <$> _tciPrimaryKey rawTableInfo <*> _tciEnumValues rawTableInfo
   tableInfos <-
     (| Inc.keyed (| withTable (\table -> processTableInfo -< (enumTables, table)) |)
-    |) rawTableCache
-  returnA -< Map.catMaybes tableInfos
+    |) (withSourceInKey source rawTableCache)
+  returnA -< removeSourceInKey (Map.catMaybes tableInfos)
   where
-    withTable :: ErrorA QErr arr (e, s) a -> arr (e, ((TableName 'Postgres), s)) (Maybe a)
+    withSourceInKey :: (Eq k, Hashable k) => SourceName -> HashMap k v -> HashMap (SourceName, k) v
+    withSourceInKey source = mapKeys (source,)
+
+    removeSourceInKey :: (Eq k, Hashable k) => HashMap (SourceName, k) v -> HashMap k v
+    removeSourceInKey = mapKeys snd
+
+    withTable :: ErrorA QErr arr (e, s) a -> arr (e, ((SourceName, TableName b), s)) (Maybe a)
     withTable f = withRecordInconsistency f <<<
-      second (first $ arr \name -> MetadataObject (MOTable name) (toJSON name))
+      second (first $ arr \(source, name) -> MetadataObject (MOSourceObjId source $ SMOTable name) (toJSON name))
 
     noDuplicateTables = proc tables -> case tables of
       table :| [] -> returnA -< table
@@ -393,27 +379,29 @@ buildTableCache = Inc.cache proc (pgTables, tableBuildInputs, reloadMetadataInva
     -- Step 1: Build the raw table cache from metadata information.
     buildRawTableInfo
       :: ErrorA QErr arr
-       ( TableBuildInput
-       , Maybe (DBTableMetadata 'Postgres)
+       ( TableBuildInput b
+       , Maybe (DBTableMetadata b)
+       , SourceConfig b
        , Inc.Dependency Inc.InvalidationKey
-       ) (TableCoreInfoG 'Postgres (RawColumnInfo 'Postgres) (Column 'Postgres))
-    buildRawTableInfo = Inc.cache proc (tableBuildInput, maybeInfo, reloadMetadataInvalidationKey) -> do
+       ) (TableCoreInfoG b (RawColumnInfo b) (Column b))
+    buildRawTableInfo = Inc.cache proc (tableBuildInput, maybeInfo, pgSourceConfig, reloadMetadataInvalidationKey) -> do
       let TableBuildInput name isEnum config = tableBuildInput
       metadataTable <-
         (| onNothingA (throwA -<
              err400 NotExists $ "no such table/view exists in postgres: " <>> name)
         |) maybeInfo
 
-      let columns = _ptmiColumns metadataTable
+      let columns :: [RawColumnInfo b] = _ptmiColumns metadataTable
           columnMap = mapFromL (FieldName . toTxt . prciName) columns
           primaryKey = _ptmiPrimaryKey metadataTable
-      rawPrimaryKey <- liftEitherA -< traverse (resolvePrimaryKeyColumns @'Postgres columnMap) primaryKey
+      rawPrimaryKey <- liftEitherA -< traverse (resolvePrimaryKeyColumns columnMap) primaryKey
       enumValues <- if isEnum
         then do
           -- We want to make sure we reload enum values whenever someone explicitly calls
           -- `reload_metadata`.
           Inc.dependOn -< reloadMetadataInvalidationKey
-          bindErrorA -< Just <$> fetchAndValidateEnumValues name rawPrimaryKey columns
+          eitherEnums <- bindA -< fetchAndValidateEnumValues pgSourceConfig name rawPrimaryKey columns
+          liftEitherA -< Just <$> eitherEnums
         else returnA -< Nothing
 
       returnA -< TableCoreInfo
@@ -432,10 +420,8 @@ buildTableCache = Inc.cache proc (pgTables, tableBuildInputs, reloadMetadataInva
     -- Step 2: Process the raw table cache to replace Postgres column types with logical column
     -- types.
     processTableInfo
-      :: forall b
-       . Backend b
-      => ErrorA QErr arr
-       ( Map.HashMap (TableName b) (PrimaryKey (Column b), EnumValues)
+      :: ErrorA QErr arr
+       ( Map.HashMap (TableName b) (PrimaryKey b (Column b), EnumValues)
        , TableCoreInfoG b (RawColumnInfo b) (Column b)
        ) (TableCoreInfoG b (ColumnInfo b) (ColumnInfo b))
     processTableInfo = proc (enumTables, rawInfo) -> liftEitherA -< do
@@ -446,14 +432,14 @@ buildTableCache = Inc.cache proc (pgTables, tableBuildInputs, reloadMetadataInva
         >>= traverse (processColumnInfo enumReferences (_tciName rawInfo))
       assertNoDuplicateFieldNames (Map.elems columnInfoMap)
 
-      primaryKey <- traverse (resolvePrimaryKeyColumns @b columnInfoMap) (_tciPrimaryKey rawInfo)
+      primaryKey <- traverse (resolvePrimaryKeyColumns columnInfoMap) (_tciPrimaryKey rawInfo)
       pure rawInfo
         { _tciFieldInfoMap = columnInfoMap
         , _tciPrimaryKey = primaryKey
         }
 
     resolvePrimaryKeyColumns
-      :: forall b n a . (Backend b, QErrM n) => HashMap FieldName a -> PrimaryKey (Column b) -> n (PrimaryKey a)
+      :: forall n a . (QErrM n) => HashMap FieldName a -> PrimaryKey b (Column b) -> n (PrimaryKey b a)
     resolvePrimaryKeyColumns columnMap = traverseOf (pkColumns.traverse) \columnName ->
       Map.lookup (FieldName (toTxt columnName)) columnMap
         `onNothing` throw500 "column in primary key not in table!"
@@ -461,10 +447,10 @@ buildTableCache = Inc.cache proc (pgTables, tableBuildInputs, reloadMetadataInva
     alignCustomColumnNames
       :: (QErrM n)
       => FieldInfoMap (RawColumnInfo b)
-      -> CustomColumnNames
+      -> CustomColumnNames b
       -> n (FieldInfoMap (RawColumnInfo b, G.Name))
     alignCustomColumnNames columns customNames = do
-      let customNamesByFieldName = mapKeys (fromCol @'Postgres) customNames
+      let customNamesByFieldName = mapKeys (fromCol @b) customNames
       flip Map.traverseWithKey (align columns customNamesByFieldName) \columnName -> \case
         This column -> (column,) <$> textToName (getFieldNameTxt columnName)
         These column customName -> pure (column, customName)
@@ -474,7 +460,7 @@ buildTableCache = Inc.cache proc (pgTables, tableBuildInputs, reloadMetadataInva
     -- | “Processes” a '(RawColumnInfo 'Postgres)' into a 'PGColumnInfo' by resolving its type using a map of
     -- known enum tables.
     processColumnInfo
-      :: (Backend b, QErrM n)
+      :: (QErrM n)
       => Map.HashMap (Column b) (NonEmpty (EnumReference b))
       -> TableName b -- ^ the table this column belongs to
       -> (RawColumnInfo b, G.Name)

@@ -27,11 +27,11 @@ import qualified Data.HashMap.Strict                as M
 import qualified Data.HashSet                       as HS
 import qualified Data.List.NonEmpty                 as NE
 
-import           Data.Aeson.Casing
 import           Data.Aeson.TH
 import           Data.List.Extended                 (duplicates)
+import           Data.Typeable                      (cast)
 
-import           Hasura.Backends.Postgres.SQL.Types
+import           Hasura.Backends.Postgres.SQL.Types hiding (TableName)
 import           Hasura.RQL.DDL.Schema.Common
 import           Hasura.RQL.Types                   hiding (ConstraintName, fmFunction,
                                                      tmComputedFields, tmTable)
@@ -42,14 +42,14 @@ data FunctionMeta
   , fmFunction :: !QualifiedFunction
   , fmType     :: !FunctionVolatility
   } deriving (Show, Eq)
-$(deriveJSON (aesonDrop 2 snakeCase) ''FunctionMeta)
+$(deriveJSON hasuraJSON ''FunctionMeta)
 
 data ComputedFieldMeta
   = ComputedFieldMeta
   { ccmName         :: !ComputedFieldName
   , ccmFunctionMeta :: !FunctionMeta
   } deriving (Show, Eq)
-$(deriveJSON (aesonDrop 3 snakeCase){omitNothingFields=True} ''ComputedFieldMeta)
+$(deriveJSON hasuraJSON{omitNothingFields=True} ''ComputedFieldMeta)
 
 data TableMeta (b :: BackendType)
   = TableMeta
@@ -61,7 +61,7 @@ data TableMeta (b :: BackendType)
 fetchMeta
   :: (MonadTx m)
   => TableCache 'Postgres
-  -> FunctionCache
+  -> FunctionCache 'Postgres
   -> m ([TableMeta 'Postgres], [FunctionMeta])
 fetchMeta tables functions = do
   tableMetaInfos <- fetchTableMetadata
@@ -174,21 +174,21 @@ getTableDiff oldtm newtm =
 
 getTableChangeDeps
   :: (QErrM m, CacheRM m)
-  => QualifiedTable -> TableDiff 'Postgres -> m [SchemaObjId]
-getTableChangeDeps tn tableDiff = do
+  => SourceName -> QualifiedTable -> TableDiff 'Postgres -> m [SchemaObjId]
+getTableChangeDeps source tn tableDiff = do
   sc <- askSchemaCache
   -- for all the dropped columns
   droppedColDeps <- fmap concat $ forM droppedCols $ \droppedCol -> do
-    let objId = SOTableObj tn $ TOCol droppedCol
+    let objId = SOSourceObj source $ SOITableObj tn $ TOCol droppedCol
     return $ getDependentObjs sc objId
   -- for all dropped constraints
   droppedConsDeps <- fmap concat $ forM droppedFKeyConstraints $ \droppedCons -> do
-    let objId = SOTableObj tn $ TOForeignKey droppedCons
+    let objId = SOSourceObj source $ SOITableObj tn $ TOForeignKey droppedCons
     return $ getDependentObjs sc objId
   return $ droppedConsDeps <> droppedColDeps <> droppedComputedFieldDeps
   where
     TableDiff _ droppedCols _ _ droppedFKeyConstraints computedFieldDiff _ _ = tableDiff
-    droppedComputedFieldDeps = map (SOTableObj tn . TOComputedField) $ _cfdDropped computedFieldDiff
+    droppedComputedFieldDeps = map (SOSourceObj source . SOITableObj tn . TOComputedField) $ _cfdDropped computedFieldDiff
 
 data SchemaDiff (b :: BackendType)
   = SchemaDiff
@@ -207,21 +207,24 @@ getSchemaDiff oldMeta newMeta =
 
 getSchemaChangeDeps
   :: (QErrM m, CacheRM m)
-  => SchemaDiff 'Postgres -> m [SchemaObjId]
-getSchemaChangeDeps schemaDiff = do
+  => SourceName -> SchemaDiff 'Postgres -> m [SchemaObjId]
+getSchemaChangeDeps source schemaDiff = do
   -- Get schema cache
   sc <- askSchemaCache
-  let tableIds = map SOTable droppedTables
+  let tableIds = map (SOSourceObj source . SOITable) droppedTables
   -- Get the dependent of the dropped tables
   let tableDropDeps = concatMap (getDependentObjs sc) tableIds
-  tableModDeps <- concat <$> traverse (uncurry getTableChangeDeps) alteredTables
+  tableModDeps <- concat <$> traverse (uncurry (getTableChangeDeps source)) alteredTables
   return $ filter (not . isDirectDep) $
     HS.toList $ HS.fromList $ tableDropDeps <> tableModDeps
   where
     SchemaDiff droppedTables alteredTables = schemaDiff
 
-    isDirectDep (SOTableObj tn _) = tn `HS.member` HS.fromList droppedTables
-    isDirectDep _                 = False
+    isDirectDep (SOSourceObj s (SOITableObj tn _)) =
+      case cast tn of
+        Nothing      -> False
+        Just pgTable -> s == source && pgTable `HS.member` HS.fromList droppedTables
+    isDirectDep _                  = False
 
 data FunctionDiff
   = FunctionDiff
